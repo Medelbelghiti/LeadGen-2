@@ -1,0 +1,487 @@
+// LeadGen 2.0 — Prisma schema
+// Multi-tenant SaaS data model. Every customer-owned entity carries userId (or orgId).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------- Auth & Users -----------------------------
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  name            String?
+  role            String    @default("USER") // USER | ADMIN
+  locale          String    @default("en")
+  emailVerifiedAt DateTime?
+
+  // Billing
+  stripeCustomerId String?   @unique
+  planId           String?
+  plan             Plan?     @relation("UserPlan", fields: [planId], references: [id])
+  trialEndsAt      DateTime?
+  trialUsed        Boolean   @default(false)
+
+  // Referral
+  referralCode String  @unique
+  bonusLeads   Int     @default(0) // extra leads granted by referral rewards
+  referredById String?
+  referredBy   User?   @relation("Referrer", fields: [referredById], references: [id])
+  referrals    User[]  @relation("Referrer")
+
+  // Anti-abuse
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+  signupIp            String?
+
+  // Team
+  orgMemberships OrganizationMember[]
+
+  searches       Search[]
+  leads          Lead[]
+  exports        Export[]
+  usageEvents    UsageLedger[]
+  invoices       Invoice[]
+  subscriptions  Subscription[]
+  apiKeys        ApiKey[]
+  notifications  Notification[]
+  redemptions    CouponRedemption[]
+  referralEvents Referral[]       @relation("ReferrerEvents")
+  referredEvent  Referral?        @relation("ReferredEvent")
+  affiliate      Affiliate?
+  auditLogs      AuditLog[]
+  tokens         VerificationToken[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([role])
+}
+
+model VerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  type      String // VERIFY_EMAIL | PASSWORD_RESET
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, type])
+}
+
+// ----------------------------- Plans & Billing -----------------------------
+
+model Plan {
+  id                String  @id @default(cuid())
+  key               String  @unique // free | pro | business | lifetime | custom...
+  name              String
+  description       String?
+  priceCents        Int     @default(0)
+  currency          String  @default("usd")
+  billingPeriod     String  @default("MONTHLY") // FREE | MONTHLY | YEARLY | LIFETIME
+  monthlyLeadLimit  Int     @default(100)
+  monthlySearchLimit Int    @default(20)
+  dailySearchLimit  Int     @default(5)
+  exportLimit       Int     @default(100) // rows per month
+  maxResultsPerSearch Int   @default(50)
+  providers         String  @default("[\"demo\"]") // JSON array of provider keys
+  features          String  @default("[]") // JSON array of feature labels for pricing page
+  teamMembersLimit  Int     @default(1)
+  apiAccess         Boolean @default(false)
+  apiMonthlyQuota   Int     @default(0)
+  stripePriceId     String?
+  stripeProductId   String?
+  active            Boolean @default(true)
+  sortOrder         Int     @default(0)
+
+  users         User[]         @relation("UserPlan")
+  subscriptions Subscription[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Subscription {
+  id                   String    @id @default(cuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId               String
+  plan                 Plan      @relation(fields: [planId], references: [id])
+  stripeSubscriptionId String?   @unique
+  status               String // active | trialing | past_due | canceled | incomplete | unpaid | lifetime
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean   @default(false)
+  canceledAt           DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([userId, status])
+}
+
+model Invoice {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stripeInvoiceId String   @unique
+  number          String?
+  amountCents     Int
+  currency        String   @default("usd")
+  status          String // paid | open | void | uncollectible | refunded
+  planName        String?
+  hostedUrl       String?
+  pdfUrl          String?
+  periodStart     DateTime?
+  periodEnd       DateTime?
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+}
+
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  eventId     String    @unique // Stripe event id — idempotency guard
+  type        String
+  processedAt DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+}
+
+// ----------------------------- Leads & Search -----------------------------
+
+model Search {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  niche         String
+  keywords      String?
+  countryCode   String?
+  countryName   String?
+  location      String
+  latitude      Float?
+  longitude     Float?
+  radiusKm      Float?
+  maxResults    Int      @default(50)
+  providers     String   @default("[]") // JSON array
+  status        String   @default("QUEUED") // QUEUED | RUNNING | COMPLETED | FAILED | CANCELED
+  progress      Int      @default(0)
+  progressMessage String?
+  resultsCount  Int      @default(0)
+  duplicatesRemoved Int  @default(0)
+  providerStats String   @default("{}") // JSON: per-provider {requested,results,status,error}
+  error         String?
+  isDemo        Boolean  @default(false)
+  durationMs    Int?
+  cancelRequested Boolean @default(false)
+  createdAt     DateTime @default(now())
+  completedAt   DateTime?
+
+  leads  Lead[]
+  exports Export[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model Lead {
+  id                 String   @id @default(cuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  searchId           String?
+  search             Search?  @relation(fields: [searchId], references: [id], onDelete: SetNull)
+  organizationId     String?
+
+  businessName       String
+  category           String?
+  subcategory        String?
+  description        String?
+  phone              String?
+  originalPhone      String?
+  internationalPhone String?
+  email              String?
+  website            String?
+  domain             String?
+  address            String?
+  street             String?
+  city               String?
+  region             String?
+  postalCode         String?
+  country            String?
+  countryCode        String?
+  latitude           Float?
+  longitude          Float?
+  rating             Float?
+  reviewCount        Int?
+  openingHours       String?
+
+  source             String // demo | openstreetmap | google | ...
+  sourceId           String?
+  sourceUrl          String?
+  isDemo             Boolean  @default(false)
+  dataQualityScore   Int      @default(0)
+  phoneVerified      Boolean  @default(false)
+  websiteVerified    Boolean  @default(false)
+  emailVerified      Boolean  @default(false)
+
+  status        String    @default("NEW") // NEW | CONTACTED | QUALIFIED | CONVERTED | REJECTED
+  tags          String    @default("[]") // JSON array
+  notes         String?
+  followUpAt    DateTime?
+  customFields  String    @default("{}")
+
+  collectedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+  @@index([searchId])
+  @@index([userId, countryCode])
+  @@index([userId, category])
+}
+
+model Export {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  searchId  String?
+  search    Search?  @relation(fields: [searchId], references: [id], onDelete: SetNull)
+  format    String // csv | xlsx | json
+  rowCount  Int
+  filterJson String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// ----------------------------- Usage & Limits -----------------------------
+
+model UsageLedger {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action    String // LEAD | SEARCH | EXPORT | PROVIDER_REQUEST | API_REQUEST
+  quantity  Int      @default(1)
+  provider  String?
+  searchId  String?
+  planKey   String?
+  periodKey String // e.g. "2026-09" or "2026-09-20"
+  createdAt DateTime @default(now())
+
+  @@index([userId, action, periodKey])
+}
+
+model ProviderUsage {
+  id                 String   @id @default(cuid())
+  provider           String
+  userId             String?
+  searchId           String?
+  requests           Int      @default(0)
+  results            Int      @default(0)
+  estimatedCostCents Int      @default(0)
+  periodKey          String
+  createdAt          DateTime @default(now())
+
+  @@index([provider, periodKey])
+}
+
+model RateLimitEntry {
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
+}
+
+// ----------------------------- Coupons -----------------------------
+
+model Coupon {
+  id                String    @id @default(cuid())
+  code              String    @unique
+  type              String // PERCENT | FIXED
+  value             Int // percent (1-100) or amount in cents
+  duration          String    @default("ONCE") // ONCE | FIRST_MONTH | FOREVER
+  durationMonths    Int?
+  firstPurchaseOnly Boolean   @default(false)
+  expiresAt         DateTime?
+  maxRedemptions    Int?
+  perUserLimit      Int       @default(1)
+  minPurchaseCents  Int?
+  planKeys          String    @default("[]") // JSON array; empty = all plans
+  active            Boolean   @default(true)
+  timesRedeemed     Int       @default(0)
+  stripeCouponId    String?
+  createdAt         DateTime  @default(now())
+
+  redemptions CouponRedemption[]
+}
+
+model CouponRedemption {
+  id        String   @id @default(cuid())
+  couponId  String
+  coupon    Coupon   @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([couponId])
+  @@index([userId])
+}
+
+// ----------------------------- Referrals & Affiliates -----------------------------
+
+model Referral {
+  id             String    @id @default(cuid())
+  referrerId     String
+  referrer       User      @relation("ReferrerEvents", fields: [referrerId], references: [id], onDelete: Cascade)
+  referredUserId String    @unique
+  referredUser   User      @relation("ReferredEvent", fields: [referredUserId], references: [id], onDelete: Cascade)
+  status         String    @default("REGISTERED") // REGISTERED | TRIAL_STARTED | CONVERTED
+  revenueCents   Int       @default(0)
+  commissionCents Int      @default(0)
+  rewardGranted  Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  convertedAt    DateTime?
+}
+
+model Affiliate {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  code            String   @unique
+  status          String   @default("PENDING") // PENDING | APPROVED | REJECTED | SUSPENDED
+  clicks          Int      @default(0)
+  signups         Int      @default(0)
+  trials          Int      @default(0)
+  paidUsers       Int      @default(0)
+  revenueCents    Int      @default(0)
+  commissionCents Int      @default(0)
+  pendingCents    Int      @default(0)
+  paidCents       Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  payouts AffiliatePayout[]
+}
+
+model AffiliateClick {
+  id          String   @id @default(cuid())
+  affiliateId String
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([affiliateId, createdAt])
+}
+
+model AffiliatePayout {
+  id          String    @id @default(cuid())
+  affiliateId String
+  affiliate   Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
+  amountCents Int
+  status      String    @default("PENDING") // PENDING | PAID | REJECTED
+  method      String?
+  note        String?
+  createdAt   DateTime  @default(now())
+  paidAt      DateTime?
+}
+
+// ----------------------------- Teams -----------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  createdAt DateTime @default(now())
+
+  members OrganizationMember[]
+}
+
+model OrganizationMember {
+  id        String   @id @default(cuid())
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      String   @default("MEMBER") // OWNER | ADMIN | MEMBER
+  createdAt DateTime @default(now())
+
+  @@unique([orgId, userId])
+}
+
+// ----------------------------- API, Notifications, System -----------------------------
+
+model ApiKey {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  prefix         String // first chars shown in UI, e.g. "lgk_Ab12"
+  keyHash        String    @unique
+  scopes         String    @default("[\"search:read\",\"search:write\",\"leads:read\"]")
+  rateLimitPerMin Int     @default(60)
+  monthlyQuota   Int?
+  lastUsedAt     DateTime?
+  revokedAt      DateTime?
+  expiresAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String // SEARCH_COMPLETE | USAGE_WARNING | TRIAL_ENDING | PAYMENT_SUCCESS | PAYMENT_FAILED | ...
+  title     String
+  body      String?
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt])
+}
+
+model FeatureFlag {
+  key         String   @id
+  enabled     Boolean  @default(false)
+  description String?
+  updatedAt   DateTime @updatedAt
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  metadata  String?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+
+model AnalyticsEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  event     String
+  metadata  String?
+  createdAt DateTime @default(now())
+
+  @@index([event, createdAt])
+}
