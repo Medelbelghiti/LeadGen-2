@@ -112,7 +112,7 @@ export class OpenStreetMapProvider implements BusinessDataProvider {
               },
               body: "data=" + encodeURIComponent(query),
             },
-            30_000
+            9000
           );
           if (res.ok) return (await res.json()) as OverpassResponse;
           lastError = `Overpass ${res.status} from ${this.hostOf(url)}`;
@@ -129,12 +129,15 @@ export class OpenStreetMapProvider implements BusinessDataProvider {
 
   private overpassEndpoints(): string[] {
     const primary = env.osmOverpassUrl.replace(/\/+$/, "");
+    // Order matters: try the fastest, most-reliable endpoints first.
+    // Vercel Hobby has a ~10s response limit on API routes, so we prefer
+    // mirrors that typically respond in 3-6s.
     const mirrors = [
       primary,
       "https://overpass.kumi.systems/api/interpreter",
       "https://overpass.private.coffee/api/interpreter",
+      "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     ];
-    // de-duplicate while preserving order
     return Array.from(new Set(mirrors));
   }
 
