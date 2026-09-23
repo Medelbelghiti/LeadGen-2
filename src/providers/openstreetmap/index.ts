@@ -10,7 +10,11 @@ import { osmTagsForNiche } from "@/lib/osm-tags";
 
 /**
  * OpenStreetMap provider. Uses Nominatim for geocoding and the Overpass API
- * for business search. Respects public usage policies (single geocode per search).
+ * for business search. Respects public usage policies:
+ *   - one geocode per search
+ *   - one Overpass query per search
+ *   - automatic retry + fallback endpoint on transient failures
+ *   - per-query timeout to avoid hanging the search job
  */
 export class OpenStreetMapProvider implements BusinessDataProvider {
   getProviderName() {
@@ -21,7 +25,7 @@ export class OpenStreetMapProvider implements BusinessDataProvider {
       search: true,
       requiresApiKey: false,
       global: true,
-      freeQuotaPerMonth: 0, // community endpoints — respect usage policy
+      freeQuotaPerMonth: 0,
     };
   }
 
@@ -36,7 +40,7 @@ export class OpenStreetMapProvider implements BusinessDataProvider {
         : `${Number(geo.lat) - 0.5},${Number(geo.lon) - 0.5},${Number(geo.lat) + 0.5},${Number(geo.lon) + 0.5}`;
 
       const query = this.buildOverpassQuery(params, bboxStr);
-      const data = await this.overpass(query);
+      const data = await this.overpassWithFallback(query);
       const elements = (data.elements ?? []) as OverpassElement[];
       const limit = params.maxResults;
       const results: RawBusiness[] = [];
@@ -60,9 +64,9 @@ export class OpenStreetMapProvider implements BusinessDataProvider {
   private async geocode(p: BusinessSearchParams): Promise<GeocodeResult | null> {
     const q = encodeURIComponent(`${p.location}${p.countryCode ? ", " + p.countryCode : ""}`);
     const url = `${env.osmNominatimUrl}/search?q=${q}&format=json&limit=1&addressdetails=1`;
-    const res = await fetch(url, {
+    const res = await this.fetchWithTimeout(url, {
       headers: { "User-Agent": "LeadGen-2.0/1.0 (https://leadgen.example)" },
-    });
+    }, 10_000);
     if (!res.ok) throw new Error(`Nominatim error: ${res.status}`);
     const data = (await res.json()) as GeocodeResult[];
     return data[0] ?? null;
@@ -87,14 +91,73 @@ export class OpenStreetMapProvider implements BusinessDataProvider {
     return `[out:json][timeout:25];(\n${filters.join("\n")}\n);out center ${p.maxResults + 50};`;
   }
 
-  private async overpass(query: string): Promise<OverpassResponse> {
-    const res = await fetch(env.osmOverpassUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "LeadGen-2.0/1.0" },
-      body: "data=" + encodeURIComponent(query),
-    });
-    if (!res.ok) throw new Error(`Overpass error: ${res.status}`);
-    return (await res.json()) as OverpassResponse;
+  /**
+   * Tries the configured Overpass endpoint, then falls back to known mirrors
+   * if the first attempt returns 504/timeout/network errors. Retries once
+   * per endpoint with a short backoff.
+   */
+  private async overpassWithFallback(query: string): Promise<OverpassResponse> {
+    const endpoints = this.overpassEndpoints();
+    let lastError: string | null = null;
+    for (const url of endpoints) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const res = await this.fetchWithTimeout(
+            url,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "LeadGen-2.0/1.0",
+              },
+              body: "data=" + encodeURIComponent(query),
+            },
+            30_000
+          );
+          if (res.ok) return (await res.json()) as OverpassResponse;
+          lastError = `Overpass ${res.status} from ${this.hostOf(url)}`;
+          // 4xx other than 429 are unlikely to recover — skip to next endpoint
+          if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
+        } catch (e) {
+          lastError = e instanceof Error ? e.message : String(e);
+        }
+        await sleep(800 * attempt);
+      }
+    }
+    throw new Error(lastError ?? "Overpass: all endpoints failed");
+  }
+
+  private overpassEndpoints(): string[] {
+    const primary = env.osmOverpassUrl.replace(/\/+$/, "");
+    const mirrors = [
+      primary,
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.private.coffee/api/interpreter",
+    ];
+    // de-duplicate while preserving order
+    return Array.from(new Set(mirrors));
+  }
+
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private hostOf(url: string): string {
+    try {
+      return new URL(url).host;
+    } catch {
+      return url;
+    }
   }
 
   private toBusiness(el: OverpassElement, p: BusinessSearchParams): RawBusiness | null {
@@ -139,6 +202,10 @@ function composeAddress(tags: Record<string, string>): string {
     tags["addr:country"],
   ].filter(Boolean);
   return parts.join(", ") || "";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 interface GeocodeResult {
