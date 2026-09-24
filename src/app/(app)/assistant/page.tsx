@@ -24,7 +24,11 @@ export default function AssistantPage() {
     setLoading(true);
     setAnswer(null);
     try {
-      const res = await fetch(`/api/assistant?q=${encodeURIComponent(question)}`);
+      const res = await fetch("/api/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
       const j = await res.json();
       setData(j);
       setAnswer(j.answer ?? "I don't have an answer for that yet.");

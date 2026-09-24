@@ -151,10 +151,10 @@ export async function createBillingPortalSession(
   return { url: session.url };
 }
 
-export async function cancelSubscription(opts: { atPeriodEnd: boolean }): Promise<{ ok: boolean; error?: string }> {
+export async function cancelSubscription(opts: { userId: string; atPeriodEnd: boolean }): Promise<{ ok: boolean; error?: string }> {
   const stripe = requireStripe();
   const sub = await db.subscription.findFirst({
-    where: { stripeSubscriptionId: { not: null } },
+    where: { userId: opts.userId, stripeSubscriptionId: { not: null } },
     orderBy: { createdAt: "desc" },
   });
   if (!sub?.stripeSubscriptionId) return { ok: false, error: "No active subscription" };

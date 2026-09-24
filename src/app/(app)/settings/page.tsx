@@ -27,7 +27,10 @@ export default async function SettingsPage() {
           <p className="font-semibold">Subscription</p>
           <p className="text-sm text-charcoal-500 mt-1">Plan: <strong>{ent.planName}</strong> ({ent.subscriptionStatus ?? "free"})</p>
           {ent.isTrial && ent.trialEndsAt && <p className="text-sm text-amber-700 mt-1">Trial ends {ent.trialEndsAt.toISOString().slice(0, 10)}</p>}
-          <Link href="/pricing" className="btn btn-primary mt-3">Manage plan</Link>
+          <div className="flex gap-2 mt-3">
+            <Link href="/settings/billing" className="btn btn-primary">Manage billing</Link>
+            <Link href="/pricing" className="btn btn-secondary">View plans</Link>
+          </div>
         </div>
         <div className="card border-rose-200">
           <p className="font-semibold text-rose-700">Danger zone</p>

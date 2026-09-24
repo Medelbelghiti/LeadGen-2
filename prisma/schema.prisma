@@ -557,3 +557,22 @@ model AnalyticsEvent {
 
   @@index([event, createdAt])
 }
+
+// ----------------------------- Savings goals -----------------------------
+
+model SavingsGoal {
+  id          String   @id @default(cuid())
+  userId      String
+  vehicleId   String?
+  name        String
+  category    String   // monthly_fuel | monthly_parking | maintenance_fund | replacement_fund | custom
+  targetCents Int
+  savedCents  Int      @default(0)
+  currency    String   @default("USD")
+  deadline    DateTime?
+  achievedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId, achievedAt])
+}
