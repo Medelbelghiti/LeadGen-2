@@ -1,20 +1,9 @@
 import { cookies } from "next/headers";
 import { SignJWT, jwtVerify } from "jose";
 import bcrypt from "bcryptjs";
-import crypto from "crypto";
 import { db } from "./db";
 import { env } from "./env";
 import type { User } from "@prisma/client";
-
-export function generateReferralCode(name?: string | null): string {
-  const base = (name ?? "USER")
-    .replace(/[^a-zA-Z]/g, "")
-    .slice(0, 3)
-    .toUpperCase()
-    .padEnd(3, "X");
-  const suffix = crypto.randomBytes(3).toString("hex").toUpperCase();
-  return `LEADGEN-${base}${suffix}`;
-}
 
 const SESSION_COOKIE = "lg_session";
 const SESSION_DAYS = 30;

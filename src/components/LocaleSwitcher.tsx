@@ -28,7 +28,7 @@ export function LocaleSwitcher({ current }: { current: string }) {
     >
       {LOCALES.map((l) => (
         <option key={l} value={l}>
-          {l.toUpperCase()}
+          {l === "en" ? "EN" : "FR"}
         </option>
       ))}
     </select>

@@ -1,15 +1,14 @@
 import en from "@/locales/en.json";
 import fr from "@/locales/fr.json";
-import ar from "@/locales/ar.json";
 
-export type Locale = "en" | "fr" | "ar";
-export const LOCALES: Locale[] = ["en", "fr", "ar"];
+export type Locale = "en" | "fr";
+export const LOCALES: Locale[] = ["en", "fr"];
 export const DEFAULT_LOCALE: Locale = "en";
 
-const dictionaries: Record<Locale, Record<string, string>> = { en, fr, ar };
+const dictionaries: Record<Locale, Record<string, string>> = { en, fr };
 
 export function isLocale(v: string | undefined | null): v is Locale {
-  return v === "en" || v === "fr" || v === "ar";
+  return v === "en" || v === "fr";
 }
 
 export function getDictionary(locale: Locale): Record<string, string> {
@@ -22,5 +21,5 @@ export function translate(locale: Locale, key: string, fallback?: string): strin
 }
 
 export function dirFor(locale: Locale): "ltr" | "rtl" {
-  return locale === "ar" ? "rtl" : "ltr";
+  return "ltr";
 }

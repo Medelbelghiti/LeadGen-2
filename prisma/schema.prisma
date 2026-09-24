@@ -1,5 +1,6 @@
-// LeadGen 2.0 — Prisma schema
-// Multi-tenant SaaS data model. Every customer-owned entity carries userId (or orgId).
+// AutoEco — Prisma schema
+// Multi-tenant SaaS for personal automotive financial tracking.
+// Every customer-owned entity carries userId (or organizationId).
 
 generator client {
   provider = "prisma-client-js"
@@ -19,21 +20,21 @@ model User {
   name            String?
   role            String    @default("USER") // USER | ADMIN
   locale          String    @default("en")
-  emailVerifiedAt DateTime?
+
+  // Preferences
+  country         String?  // ISO-3166 alpha-2
+  currency        String   @default("USD")
+  distanceUnit    String   @default("km") // km | mi
+  fuelUnit        String   @default("L_PER_100KM") // L_PER_100KM | MPG | KM_PER_L
 
   // Billing
-  stripeCustomerId String?   @unique
+  stripeCustomerId String?  @unique
   planId           String?
-  plan             Plan?     @relation("UserPlan", fields: [planId], references: [id])
+  plan             Plan?    @relation("UserPlan", fields: [planId], references: [id])
   trialEndsAt      DateTime?
-  trialUsed        Boolean   @default(false)
+  trialUsed        Boolean  @default(false)
 
-  // Referral
-  referralCode String  @unique
-  bonusLeads   Int     @default(0) // extra leads granted by referral rewards
-  referredById String?
-  referredBy   User?   @relation("Referrer", fields: [referredById], references: [id])
-  referrals    User[]  @relation("Referrer")
+  emailVerifiedAt DateTime?
 
   // Anti-abuse
   failedLoginAttempts Int       @default(0)
@@ -41,29 +42,31 @@ model User {
   lastLoginAt         DateTime?
   signupIp            String?
 
-  // Team
-  orgMemberships OrganizationMember[]
-
-  searches       Search[]
-  leads          Lead[]
-  exports        Export[]
-  usageEvents    UsageLedger[]
-  invoices       Invoice[]
-  subscriptions  Subscription[]
-  apiKeys        ApiKey[]
+  // Relations
+  vehicles       Vehicle[]
+  expenses       Expense[]
+  fuelEntries    FuelEntry[]
+  documents      Document[]
+  forecasts      Forecast[]
+  scenarios      Scenario[]
+  conversations  Conversation[]
+  achievements   Achievement[]
+  reports        Report[]
+  shareLinks     ShareLink[]
   notifications  Notification[]
-  redemptions    CouponRedemption[]
-  referralEvents Referral[]       @relation("ReferrerEvents")
-  referredEvent  Referral?        @relation("ReferredEvent")
-  affiliate      Affiliate?
-  auditLogs      AuditLog[]
   tokens         VerificationToken[]
+  auditLogs      AuditLog[]
+  subscriptions  Subscription[]
+  invoices       Invoice[]
+  apiKeys        ApiKey[]
+  couponRedemptions CouponRedemption[]
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
   @@index([role])
+  @@index([email])
 }
 
 model VerificationToken {
@@ -83,22 +86,26 @@ model VerificationToken {
 
 model Plan {
   id                String  @id @default(cuid())
-  key               String  @unique // free | pro | business | lifetime | custom...
+  key               String  @unique // free | pro | family | pro_plus
   name              String
   description       String?
   priceCents        Int     @default(0)
   currency          String  @default("usd")
   billingPeriod     String  @default("MONTHLY") // FREE | MONTHLY | YEARLY | LIFETIME
-  monthlyLeadLimit  Int     @default(100)
-  monthlySearchLimit Int    @default(20)
-  dailySearchLimit  Int     @default(5)
-  exportLimit       Int     @default(100) // rows per month
-  maxResultsPerSearch Int   @default(50)
-  providers         String  @default("[\"demo\"]") // JSON array of provider keys
-  features          String  @default("[]") // JSON array of feature labels for pricing page
-  teamMembersLimit  Int     @default(1)
-  apiAccess         Boolean @default(false)
-  apiMonthlyQuota   Int     @default(0)
+
+  // Limits
+  maxVehicles       Int     @default(1)
+  maxExpensesPerMonth Int  @default(100)
+  aiReceiptScansPerMonth Int @default(0)
+  aiConversationsPerMonth Int @default(0)
+  reportRetentionDays Int   @default(30)
+  forecastHorizonMonths Int @default(12)
+  enableAdvancedScenarios Boolean @default(false)
+  enableShareableReports  Boolean @default(false)
+  enableFamilySharing     Boolean @default(false)
+  enableApiAccess         Boolean @default(false)
+
+  features          String  @default("[]") // JSON array of feature labels
   stripePriceId     String?
   stripeProductId   String?
   active            Boolean @default(true)
@@ -137,7 +144,7 @@ model Invoice {
   number          String?
   amountCents     Int
   currency        String   @default("usd")
-  status          String // paid | open | void | uncollectible | refunded
+  status          String
   planName        String?
   hostedUrl       String?
   pdfUrl          String?
@@ -150,172 +157,26 @@ model Invoice {
 
 model WebhookEvent {
   id          String    @id @default(cuid())
-  eventId     String    @unique // Stripe event id — idempotency guard
+  eventId     String    @unique
   type        String
   processedAt DateTime?
   error       String?
   createdAt   DateTime  @default(now())
 }
 
-// ----------------------------- Leads & Search -----------------------------
-
-model Search {
-  id            String   @id @default(cuid())
-  userId        String
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  niche         String
-  keywords      String?
-  countryCode   String?
-  countryName   String?
-  location      String
-  latitude      Float?
-  longitude     Float?
-  radiusKm      Float?
-  maxResults    Int      @default(50)
-  providers     String   @default("[]") // JSON array
-  status        String   @default("QUEUED") // QUEUED | RUNNING | COMPLETED | FAILED | CANCELED
-  progress      Int      @default(0)
-  progressMessage String?
-  resultsCount  Int      @default(0)
-  duplicatesRemoved Int  @default(0)
-  providerStats String   @default("{}") // JSON: per-provider {requested,results,status,error}
-  error         String?
-  isDemo        Boolean  @default(false)
-  durationMs    Int?
-  cancelRequested Boolean @default(false)
-  createdAt     DateTime @default(now())
-  completedAt   DateTime?
-
-  leads  Lead[]
-  exports Export[]
-
-  @@index([userId, createdAt])
-  @@index([status])
-}
-
-model Lead {
-  id                 String   @id @default(cuid())
-  userId             String
-  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  searchId           String?
-  search             Search?  @relation(fields: [searchId], references: [id], onDelete: SetNull)
-  organizationId     String?
-
-  businessName       String
-  category           String?
-  subcategory        String?
-  description        String?
-  phone              String?
-  originalPhone      String?
-  internationalPhone String?
-  email              String?
-  website            String?
-  domain             String?
-  address            String?
-  street             String?
-  city               String?
-  region             String?
-  postalCode         String?
-  country            String?
-  countryCode        String?
-  latitude           Float?
-  longitude          Float?
-  rating             Float?
-  reviewCount        Int?
-  openingHours       String?
-
-  source             String // demo | openstreetmap | google | ...
-  sourceId           String?
-  sourceUrl          String?
-  isDemo             Boolean  @default(false)
-  dataQualityScore   Int      @default(0)
-  phoneVerified      Boolean  @default(false)
-  websiteVerified    Boolean  @default(false)
-  emailVerified      Boolean  @default(false)
-
-  status        String    @default("NEW") // NEW | CONTACTED | QUALIFIED | CONVERTED | REJECTED
-  tags          String    @default("[]") // JSON array
-  notes         String?
-  followUpAt    DateTime?
-  customFields  String    @default("{}")
-
-  collectedAt DateTime @default(now())
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@index([userId, status])
-  @@index([userId, createdAt])
-  @@index([searchId])
-  @@index([userId, countryCode])
-  @@index([userId, category])
-}
-
-model Export {
-  id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  searchId  String?
-  search    Search?  @relation(fields: [searchId], references: [id], onDelete: SetNull)
-  format    String // csv | xlsx | json
-  rowCount  Int
-  filterJson String?
-  createdAt DateTime @default(now())
-
-  @@index([userId, createdAt])
-}
-
-// ----------------------------- Usage & Limits -----------------------------
-
-model UsageLedger {
-  id        String   @id @default(cuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  action    String // LEAD | SEARCH | EXPORT | PROVIDER_REQUEST | API_REQUEST
-  quantity  Int      @default(1)
-  provider  String?
-  searchId  String?
-  planKey   String?
-  periodKey String // e.g. "2026-09" or "2026-09-20"
-  createdAt DateTime @default(now())
-
-  @@index([userId, action, periodKey])
-}
-
-model ProviderUsage {
-  id                 String   @id @default(cuid())
-  provider           String
-  userId             String?
-  searchId           String?
-  requests           Int      @default(0)
-  results            Int      @default(0)
-  estimatedCostCents Int      @default(0)
-  periodKey          String
-  createdAt          DateTime @default(now())
-
-  @@index([provider, periodKey])
-}
-
-model RateLimitEntry {
-  key     String   @id
-  count   Int      @default(0)
-  resetAt DateTime
-}
-
-// ----------------------------- Coupons -----------------------------
-
 model Coupon {
   id                String    @id @default(cuid())
   code              String    @unique
   type              String // PERCENT | FIXED
-  value             Int // percent (1-100) or amount in cents
-  duration          String    @default("ONCE") // ONCE | FIRST_MONTH | FOREVER
+  value             Int
+  duration          String    @default("ONCE")
   durationMonths    Int?
   firstPurchaseOnly Boolean   @default(false)
   expiresAt         DateTime?
   maxRedemptions    Int?
   perUserLimit      Int       @default(1)
   minPurchaseCents  Int?
-  planKeys          String    @default("[]") // JSON array; empty = all plans
+  planKeys          String    @default("[]") // JSON
   active            Boolean   @default(true)
   timesRedeemed     Int       @default(0)
   stripeCouponId    String?
@@ -336,111 +197,296 @@ model CouponRedemption {
   @@index([userId])
 }
 
-// ----------------------------- Referrals & Affiliates -----------------------------
+// ----------------------------- Vehicle catalog -----------------------------
+// Normalized, market-aware vehicle catalog. Marked isDemo=false; sample
+// records can be added by the admin with isDemo=true for UI previews.
 
-model Referral {
-  id             String    @id @default(cuid())
-  referrerId     String
-  referrer       User      @relation("ReferrerEvents", fields: [referrerId], references: [id], onDelete: Cascade)
-  referredUserId String    @unique
-  referredUser   User      @relation("ReferredEvent", fields: [referredUserId], references: [id], onDelete: Cascade)
-  status         String    @default("REGISTERED") // REGISTERED | TRIAL_STARTED | CONVERTED
-  revenueCents   Int       @default(0)
-  commissionCents Int      @default(0)
-  rewardGranted  Boolean   @default(false)
-  createdAt      DateTime  @default(now())
-  convertedAt    DateTime?
-}
-
-model Affiliate {
+model VehicleCatalogEntry {
   id              String   @id @default(cuid())
-  userId          String   @unique
-  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  code            String   @unique
-  status          String   @default("PENDING") // PENDING | APPROVED | REJECTED | SUSPENDED
-  clicks          Int      @default(0)
-  signups         Int      @default(0)
-  trials          Int      @default(0)
-  paidUsers       Int      @default(0)
-  revenueCents    Int      @default(0)
-  commissionCents Int      @default(0)
-  pendingCents    Int      @default(0)
-  paidCents       Int      @default(0)
+  brand           String
+  model           String
+  generation      String?
+  trim            String?
+  yearFrom        Int?
+  yearTo          Int?
+  market          String?  // ISO-3166 alpha-2 or region
+  fuelType        String?  // gasoline | diesel | hybrid | plugin_hybrid | ev | lpg
+  transmission    String?
+  drivetrain      String?
+  engineDisplacementCc Int?
+  horsepowerHp    Int?
+  torqueNm        Int?
+  fuelEconomyCombined String? // text e.g. "6.4 L/100km" — explicit unit
+  batteryCapacityKwh Float?
+  evRangeKm       Int?
+  curbWeightKg    Int?
+  msrpCents       Int?
+  source          String?
+  sourceId        String?
+  sourceUrl       String?
+  verified        Boolean  @default(false)
+  isDemo          Boolean  @default(false)
+  notes           String?
   createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  payouts AffiliatePayout[]
+  @@index([brand, model, yearFrom])
+  @@index([market])
 }
 
-model AffiliateClick {
+// ----------------------------- Vehicles (user-owned) -----------------------------
+
+model Vehicle {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Identity
+  nickname        String?  // user-chosen display name
+  brand           String
+  model           String
+  generation      String?
+  trim            String?
+  year            Int
+  market          String?  // user country/market
+  fuelType        String   @default("gasoline")
+  transmission    String?
+  drivetrain      String?
+  engineDisplacementCc Int?
+  horsepowerHp    Int?
+  fuelEconomyText String?  // "6.4 L/100km"
+
+  // Ownership
+  purchaseDate    DateTime?
+  purchasePriceCents Int?
+  purchaseCurrency String?
+  currentMileage  Int?     // km or mi depending on user.distanceUnit
+  currentMileageUnit String? // km | mi
+  estimatedResaleCents Int?
+  estimatedResaleCurrency String?
+
+  // Misc
+  licensePlate    String?
+  vin             String?
+  isPrimary       Boolean  @default(false)
+  archived        Boolean  @default(false)
+  isDemo          Boolean  @default(false)
+  notes           String?
+
+  expenses        Expense[]
+  fuelEntries     FuelEntry[]
+  documents       Document[]
+  forecasts       Forecast[]
+  scenarios       Scenario[]
+  reports         Report[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, archived])
+  @@index([userId, isPrimary])
+}
+
+// ----------------------------- Expenses -----------------------------
+
+model Expense {
   id          String   @id @default(cuid())
-  affiliateId String
-  ip          String?
-  userAgent   String?
-  createdAt   DateTime @default(now())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId   String
+  vehicle     Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
 
-  @@index([affiliateId, createdAt])
-}
-
-model AffiliatePayout {
-  id          String    @id @default(cuid())
-  affiliateId String
-  affiliate   Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
+  category    String   // fuel | maintenance | repair | insurance | tax | registration | tires | parking | tolls | cleaning | accessories | financing | charging | other
   amountCents Int
-  status      String    @default("PENDING") // PENDING | PAID | REJECTED
-  method      String?
-  note        String?
-  createdAt   DateTime  @default(now())
-  paidAt      DateTime?
+  currency    String
+  date        DateTime
+  merchant    String?
+  mileage     Int?
+  mileageUnit String?
+  notes       String?
+  receiptUrl  String?  // signed URL reference
+  recurring   Boolean  @default(false)
+  source      String   @default("manual") // manual | receipt_scan | import
+  aiConfidence Float?
+  isDemo      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, date])
+  @@index([vehicleId, date])
+  @@index([userId, category])
 }
 
-// ----------------------------- Teams -----------------------------
+// ----------------------------- Fuel entries -----------------------------
+// Dedicated table for fuel entries to compute consumption precisely.
 
-model Organization {
-  id        String   @id @default(cuid())
-  name      String
-  ownerId   String
+model FuelEntry {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId      String
+  vehicle        Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  date           DateTime
+  amountCents    Int
+  currency       String
+  liters         Float?   // if fuel
+  kwh            Float?   // if electric
+  pricePerUnit   Float?
+  mileage        Int
+  mileageUnit    String
+  fullTank       Boolean  @default(true)
+  station        String?
+  consumption    Float?   // computed L/100km or km/L
+  notes          String?
+  isDemo         Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([vehicleId, date])
+  @@index([userId, date])
+}
+
+// ----------------------------- Documents -----------------------------
+
+model Document {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId   String?
+  vehicle     Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  title       String
+  category    String   // insurance | registration | invoice | receipt | service | purchase | other
+  storageKey  String   // server-side storage path; never expose directly
+  mimeType    String
+  sizeBytes   Int
+  expiryDate  DateTime?
+
   createdAt DateTime @default(now())
 
-  members OrganizationMember[]
+  @@index([userId, category])
+  @@index([vehicleId])
 }
 
-model OrganizationMember {
+// ----------------------------- Forecasts -----------------------------
+
+model Forecast {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId   String
+  vehicle     Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  horizonMonths Int
+  // JSON snapshot of inputs/assumptions and outputs
+  inputsJson    String
+  outputsJson   String
+  createdAt     DateTime @default(now())
+
+  @@index([vehicleId, createdAt])
+}
+
+// ----------------------------- Scenarios -----------------------------
+
+model Scenario {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId   String?
+  vehicle     Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  name        String
+  type        String // keep_vs_replace | repair_vs_replace | mileage_change | fuel_price_change
+  inputsJson  String
+  outputsJson String
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, type])
+}
+
+// ----------------------------- AI conversations -----------------------------
+
+model Conversation {
   id        String   @id @default(cuid())
-  orgId     String
-  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  role      String   @default("MEMBER") // OWNER | ADMIN | MEMBER
+  vehicleId String?
+
+  title     String?
   createdAt DateTime @default(now())
 
-  @@unique([orgId, userId])
+  messages ConversationMessage[]
+
+  @@index([userId, createdAt])
 }
 
-// ----------------------------- API, Notifications, System -----------------------------
+model ConversationMessage {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String       // user | assistant | system
+  content        String
+  tokenCount     Int?
+  createdAt      DateTime     @default(now())
 
-model ApiKey {
-  id             String    @id @default(cuid())
-  userId         String
-  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  name           String
-  prefix         String // first chars shown in UI, e.g. "lgk_Ab12"
-  keyHash        String    @unique
-  scopes         String    @default("[\"search:read\",\"search:write\",\"leads:read\"]")
-  rateLimitPerMin Int     @default(60)
-  monthlyQuota   Int?
-  lastUsedAt     DateTime?
-  revokedAt      DateTime?
-  expiresAt      DateTime?
-  createdAt      DateTime  @default(now())
+  @@index([conversationId, createdAt])
+}
+
+// ----------------------------- Achievements / savings -----------------------------
+
+model Achievement {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key       String   // first_expense | first_fuel | 30_day_tracker | first_report | first_forecast | first_comparison
+  unlockedAt DateTime @default(now())
+
+  @@unique([userId, key])
+}
+
+// ----------------------------- Reports -----------------------------
+
+model Report {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicleId String
+  vehicle   Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  title     String
+  format    String   // json | pdf | csv
+  payload   String   // JSON content
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// ----------------------------- Share links -----------------------------
+
+model ShareLink {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  reportId  String?
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
 
   @@index([userId])
 }
+
+// ----------------------------- Notifications -----------------------------
 
 model Notification {
   id        String    @id @default(cuid())
   userId    String
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type      String // SEARCH_COMPLETE | USAGE_WARNING | TRIAL_ENDING | PAYMENT_SUCCESS | PAYMENT_FAILED | ...
+  type      String
   title     String
   body      String?
   link      String?
@@ -449,6 +495,8 @@ model Notification {
 
   @@index([userId, readAt])
 }
+
+// ----------------------------- Settings / Flags / Rate limit -----------------------------
 
 model FeatureFlag {
   key         String   @id
@@ -461,6 +509,30 @@ model Setting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+model ApiKey {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  prefix         String
+  keyHash        String    @unique
+  scopes         String    @default("[]")
+  rateLimitPerMin Int     @default(60)
+  monthlyQuota   Int?
+  lastUsedAt     DateTime?
+  revokedAt      DateTime?
+  expiresAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model RateLimitEntry {
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
 }
 
 model AuditLog {

@@ -350,15 +350,9 @@ async function onInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
     },
   });
 
-  // Affiliate commission + referral conversion
-  await processAffiliateCommission({
-    userId: resolvedUserId,
-    invoiceAmountCents: invoice.amount_paid,
-  });
-  await markReferralConverted({
-    referredUserId: resolvedUserId,
-    revenueCents: invoice.amount_paid,
-  });
+  // Affiliate commission + referral conversion (V2 stubs)
+  await processAffiliateCommission();
+  await markReferralConverted();
 
   const user = await db.user.findUnique({ where: { id: resolvedUserId } });
   if (user) {
