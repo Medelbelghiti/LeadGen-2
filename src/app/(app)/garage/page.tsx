@@ -13,7 +13,9 @@ export default async function GaragePage() {
     where: { userId: user.id },
     orderBy: [{ archived: "asc" }, { isPrimary: "desc" }, { createdAt: "desc" }],
   });
-  const cards = await Promise.all(vehicles.map(async (v) => ({ v, summary: await computeVehicleCost(user.id, v.id) })));
+  const cards = await Promise.all(
+    vehicles.map(async (v) => ({ v, result: await computeVehicleCost(user.id, v.id) }))
+  );
   const canAdd = vehicles.filter((v) => !v.archived).length < ent.maxVehicles;
 
   return (
@@ -38,7 +40,7 @@ export default async function GaragePage() {
         </div>
       ) : (
         <div className="mt-6 grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {cards.map(({ v, summary }) => (
+          {cards.map(({ v, result }) => (
             <Link key={v.id} href={`/garage/${v.id}`} className="card hover:shadow-elevated transition">
               <div className="flex justify-between items-start">
                 <div>
@@ -51,11 +53,17 @@ export default async function GaragePage() {
               <div className="mt-4 grid grid-cols-2 gap-2">
                 <div className="bg-charcoal-50 dark:bg-charcoal-800/60 p-2 rounded-md">
                   <p className="text-xs text-charcoal-500">Monthly</p>
-                  <p className="font-bold">{formatMoney(summary.monthlyAverage, v.purchaseCurrency ?? "USD")}</p>
+                  <p className="font-bold">
+                    {result.ok ? formatMoney(result.summary.monthlyAverage, result.summary.baseCurrency) : "—"}
+                  </p>
                 </div>
                 <div className="bg-charcoal-50 dark:bg-charcoal-800/60 p-2 rounded-md">
                   <p className="text-xs text-charcoal-500">Cost / {v.currentMileageUnit ?? "km"}</p>
-                  <p className="font-bold">{summary.costPerKm != null ? formatMoney(summary.costPerKm, v.purchaseCurrency ?? "USD") : "—"}</p>
+                  <p className="font-bold">
+                    {result.ok && result.summary.costPerKm != null
+                      ? formatMoney(result.summary.costPerKm, result.summary.baseCurrency)
+                      : "—"}
+                  </p>
                 </div>
               </div>
               <div className="mt-3 flex items-center gap-3 text-xs text-charcoal-500">
@@ -63,6 +71,9 @@ export default async function GaragePage() {
                 <span>·</span>
                 <span>{v.purchaseDate ? new Date(v.purchaseDate).getFullYear() : "—"}</span>
               </div>
+              {!result.ok && (
+                <p className="mt-2 text-xs text-amber-700">Mixed-currency data — totals hidden.</p>
+              )}
             </Link>
           ))}
         </div>

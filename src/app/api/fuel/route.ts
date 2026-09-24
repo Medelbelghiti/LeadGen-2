@@ -4,6 +4,7 @@ import { withErrorHandling, parseJson, ok } from "@/lib/http";
 import { requireUser, assertOwnership } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { computeFuelConsumption } from "@/lib/compute-cost";
+import { isSupportedCurrency } from "@/lib/finance";
 
 const FuelSchema = z.object({
   vehicleId: z.string().min(1),
@@ -32,22 +33,44 @@ export const GET = withErrorHandling(async (req) => {
 export const POST = withErrorHandling(async (req) => {
   const user = await requireUser();
   const body = await parseJson(req, FuelSchema);
+
+  if (!isSupportedCurrency(body.currency)) {
+    return NextResponse.json({ error: "Unsupported currency" }, { status: 400 });
+  }
+  if (body.mileageUnit && !["km", "mi"].includes(body.mileageUnit)) {
+    return NextResponse.json({ error: "Unsupported mileage unit" }, { status: 400 });
+  }
+
   const vehicle = await db.vehicle.findUnique({ where: { id: body.vehicleId } });
   if (!vehicle) return NextResponse.json({ error: "Vehicle not found" }, { status: 404 });
   assertOwnership(vehicle.userId, user);
 
-  let consumption = null;
+  const date = new Date(body.date);
+
+  let consumption: number | null = null;
   if (body.liters && body.fullTank) {
-    const prior = await db.fuelEntry.findFirst({ where: { vehicleId: body.vehicleId, fullTank: true }, orderBy: { date: "desc" } });
+    // CRITICAL: prior entry must satisfy date < current date.
+    // If the user backfills a historical entry, we must NOT pick a newer
+    // entry as the "previous" reference (it would produce negative distance).
+    const prior = await db.fuelEntry.findFirst({
+      where: {
+        vehicleId: body.vehicleId,
+        fullTank: true,
+        date: { lt: date },
+        // mileage must be <= current to avoid impossible negative distance
+        mileage: { lte: body.mileage },
+      },
+      orderBy: { date: "desc" },
+    });
     if (prior && prior.liters) {
       const distance = body.mileage - prior.mileage;
-      if (distance > 0) consumption = computeFuelConsumption(body.liters, distance);
+      if (distance >= 0) consumption = computeFuelConsumption(body.liters, distance);
     }
   }
 
   const created = await db.fuelEntry.create({
     data: {
-      userId: user.id, vehicleId: body.vehicleId, date: new Date(body.date),
+      userId: user.id, vehicleId: body.vehicleId, date,
       mileage: body.mileage, mileageUnit: body.mileageUnit ?? user.distanceUnit,
       liters: body.liters ?? null, kwh: body.kwh ?? null,
       amountCents: body.amountCents, currency: body.currency,

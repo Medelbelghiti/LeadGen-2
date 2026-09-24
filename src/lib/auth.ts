@@ -5,10 +5,17 @@ import { db } from "./db";
 import { env } from "./env";
 import type { User } from "@prisma/client";
 
+// Production safety audit is run lazily inside `requireUser()` so that
+// build-time page data collection does not abort if env vars are missing
+// in development.
+
 const SESSION_COOKIE = "lg_session";
 const SESSION_DAYS = 30;
 
 function secretKey(): Uint8Array {
+  if (!env.authSecret) {
+    throw new Error("AUTH_SECRET is not set. Generate one with `node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"` and add it to your environment.");
+  }
   return new TextEncoder().encode(env.authSecret);
 }
 
@@ -58,9 +65,23 @@ export async function getCurrentUser(): Promise<User | null> {
   return user;
 }
 
+// Production safety audit runs lazily on the first protected request.
+let _prodAsserted = false;
+
 export async function requireUser(): Promise<User> {
   const user = await getCurrentUser();
   if (!user) throw new AuthError("UNAUTHENTICATED", "Authentication required");
+  if (!_prodAsserted) {
+    _prodAsserted = true;
+    try {
+      const { assertProdOnBoot } = await import("./env");
+      assertProdOnBoot();
+    } catch (e) {
+      // Re-throw so the request fails closed.
+      _prodAsserted = false;
+      throw e;
+    }
+  }
   return user;
 }
 

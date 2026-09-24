@@ -4,6 +4,7 @@ import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { saveFile, validateUpload } from "@/lib/storage";
 import { getOcrProvider } from "@/lib/ocr";
+import { ALLOWED_CATEGORIES, normalizeCategory } from "@/lib/finance";
 
 export const GET = withErrorHandling(async () => {
   const user = await requireUser();
@@ -11,13 +12,19 @@ export const GET = withErrorHandling(async () => {
   return ok({ documents: docs, ocrAvailable: getOcrProvider().available });
 });
 
+const ALLOWED_CATEGORY_SET = new Set<string>(ALLOWED_CATEGORIES);
+
 export const POST = withErrorHandling(async (req) => {
   const user = await requireUser();
   const form = await req.formData();
   const file = form.get("file");
   const vehicleIdRaw = form.get("vehicleId");
   const titleRaw = form.get("title");
-  const category = (form.get("category") as string | null) ?? "other";
+  const categoryRaw = (form.get("category") as string | null) ?? "other";
+
+  // Validate category against whitelist (never accept arbitrary strings)
+  const category = ALLOWED_CATEGORY_SET.has(categoryRaw) ? categoryRaw : "other";
+  void normalizeCategory; // imported for consistency
 
   if (!(file instanceof File)) return NextResponse.json({ error: "Missing file" }, { status: 400 });
   const err = validateUpload(file);
@@ -31,7 +38,7 @@ export const POST = withErrorHandling(async (req) => {
   }
 
   const ext = (file.name.split(".").pop() ?? "bin").toLowerCase();
-  const prefix = vehicleId ? "receipts/" + vehicleId : "receipts/user/" + user.id;
+  const prefix = vehicleId ? `receipts/${vehicleId}` : `receipts/user/${user.id}`;
   const { storageKey, sizeBytes } = await saveFile(prefix, ext, bytes);
 
   const ocr = await getOcrProvider().extract({ bytes, mimeType: file.type });
@@ -39,7 +46,7 @@ export const POST = withErrorHandling(async (req) => {
 
   const doc = await db.document.create({
     data: {
-      userId: user.id, vehicleId: vehicleId, title, category: category,
+      userId: user.id, vehicleId, title, category,
       storageKey, mimeType: file.type, sizeBytes,
     },
   });

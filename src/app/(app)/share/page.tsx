@@ -20,7 +20,11 @@ async function PublicReport({ token }: { token: string }) {
   const primary = vehicles[0];
   if (!primary) return <Error msg="No vehicle data available." />;
 
-  const summary = await computeVehicleCost(link.userId, primary.id);
+  const result = await computeVehicleCost(link.userId, primary.id);
+  if (!result.ok) {
+    return <Error msg="Owner data is temporarily unavailable or contains mixed currencies." />;
+  }
+  const summary = result.summary;
   const currency = primary.purchaseCurrency ?? "USD";
   const dep = primary.purchasePriceCents ? computeDepreciation({
     purchasePriceCents: primary.purchasePriceCents,

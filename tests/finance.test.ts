@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { summarizeExpenses, computeDepreciation, projectCost, formatMoney, estimateCO2Kg, trueOwnershipCost } from "@/lib/finance";
+﻿import { describe, it, expect } from "vitest";
+import { summarizeExpenses, computeDepreciation, projectCost, formatMoney, estimateCO2Kg, trueOwnershipCost, CurrencyMismatchError } from "@/lib/finance";
 
 describe("summarizeExpenses", () => {
   it("returns zero months data when nothing recorded", () => {
@@ -68,7 +68,13 @@ describe("projectCost", () => {
 describe("trueOwnershipCost", () => {
   it("labels forecast and estimate sources", () => {
     const summary = summarizeExpenses([{ amountCents: 60000, currency: "USD", date: new Date("2026-01-01"), category: "fuel" }], [], "USD");
-    const t = trueOwnershipCost(summary, { purchasePriceCents: 2000000, purchaseDate: new Date("2022-01-01"), estimatedResaleCents: 1500000, monthlyFixedCents: 10000 }, 12);
+    const t = trueOwnershipCost(summary, {
+      purchasePriceCents: 2000000,
+      purchaseDate: new Date("2022-01-01"),
+      estimatedResaleCents: 1500000,
+      forwardLookingFixedCents: 10000,
+      forwardLookingFixedLabel: "Insurance",
+    }, 12);
     const labels = t.breakdown.map((b) => b.source);
     expect(labels).toContain("forecast");
     expect(labels).toContain("estimate");
@@ -89,6 +95,28 @@ describe("formatMoney", () => {
     expect(formatMoney(123456)).toContain("1,234.56");
   });
   it("formats EUR", () => {
-    expect(formatMoney(123456, "EUR")).toContain("€");
+    expect(formatMoney(123456, "EUR")).toContain("\u20AC");
+  });
+});
+
+describe("Currency integrity", () => {
+  it("throws CurrencyMismatchError on mixed currencies", () => {
+    expect(() => summarizeExpenses(
+      [
+        { amountCents: 1000, currency: "USD", date: new Date("2026-01-01"), category: "fuel" },
+        { amountCents: 1000, currency: "EUR", date: new Date("2026-01-02"), category: "fuel" },
+      ],
+      [],
+      "USD"
+    )).toThrow(CurrencyMismatchError);
+  });
+  it("never produces NaN or Infinity for valid inputs", () => {
+    const s = summarizeExpenses(
+      [{ amountCents: 1000, currency: "USD", date: new Date("2026-01-01"), category: "fuel" }],
+      [], "USD"
+    );
+    expect(Number.isFinite(s.totalSpent)).toBe(true);
+    expect(Number.isFinite(s.monthlyAverage)).toBe(true);
+    expect(s.totalSpent).toBe(1000);
   });
 });

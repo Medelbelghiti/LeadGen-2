@@ -20,7 +20,10 @@ function Sidebar({ user }: { user: { id: string; email: string; name: string | n
     { href: "/expenses", label: "Expenses", icon: Receipt },
     { href: "/fuel", label: "Fuel", icon: Fuel },
     { href: "/insights", label: "Insights", icon: BarChart3 },
+    { href: "/financial-twin", label: "Financial Twin", icon: BarChart3 },
+    { href: "/scenarios", label: "Scenarios", icon: BarChart3 },
     { href: "/reports", label: "Reports", icon: BarChart3 },
+    { href: "/receipts", label: "Receipts", icon: Receipt },
     { href: "/settings", label: "Settings", icon: BarChart3 },
   ];
   return (
@@ -60,6 +63,7 @@ function MobileNav() {
     { href: "/insights", label: "Insights", icon: BarChart3 },
     { href: "/settings", label: "Profile", icon: BarChart3 },
   ];
+  void items;
   return (
     <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 bg-white dark:bg-charcoal-900 border-t border-charcoal-200 dark:border-charcoal-800 flex justify-around items-center h-16 px-1">
       {items.map((n) => (

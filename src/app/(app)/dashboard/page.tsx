@@ -5,7 +5,7 @@ import { db } from "@/lib/db";
 import { getEntitlements } from "@/lib/plans";
 import { getMonthlyUsage } from "@/lib/usage";
 import { computeVehicleCost } from "@/lib/compute-cost";
-import { formatMoney } from "@/lib/finance";
+import { formatMoney, type CostSummary } from "@/lib/finance";
 
 export default async function DashboardPage() {
   const user = await requireUser();
@@ -19,18 +19,23 @@ export default async function DashboardPage() {
 
   const primary = vehicles.find((v) => v.isPrimary) ?? vehicles[0];
 
-  let summary = null as Awaited<ReturnType<typeof computeVehicleCost>> | null;
-  if (primary) summary = await computeVehicleCost(user.id, primary.id);
+  let summary = null as CostSummary | null;
+  let mixedCurrency: string[] | null = null;
+  if (primary) {
+    const result = await computeVehicleCost(user.id, primary.id);
+    if (result.ok) summary = result.summary;
+    else if (result.error === "mixed_currency") mixedCurrency = result.currencies;
+  }
 
   return (
     <div className="max-w-6xl mx-auto p-6">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold">Welcome back{user.name ? ", " + user.name : ""}</h1>
+          <h1 className="text-2xl font-bold">Welcome back{user.name ? `, ${user.name}` : ""}</h1>
           <p className="text-sm text-charcoal-500">
             Plan: <strong>{ent.planName}</strong>
-            {ent.isTrial && ent.trialEndsAt && " · trial ends " + ent.trialEndsAt.toISOString().slice(0, 10)}
-            {ent.currentPeriodEnd && !ent.isTrial && " · renews " + ent.currentPeriodEnd.toISOString().slice(0, 10)}
+            {ent.isTrial && ent.trialEndsAt && ` · trial ends ${ent.trialEndsAt.toISOString().slice(0, 10)}`}
+            {ent.currentPeriodEnd && !ent.isTrial && ` · renews ${ent.currentPeriodEnd.toISOString().slice(0, 10)}`}
           </p>
         </div>
         <div className="flex gap-2">
@@ -48,11 +53,21 @@ export default async function DashboardPage() {
         </div>
       ) : (
         <>
+          {mixedCurrency && (
+            <div className="mt-6 card border-amber-300 bg-amber-50">
+              <p className="font-semibold text-amber-800">Mixed-currency data detected</p>
+              <p className="text-sm text-amber-700 mt-1">
+                Your expenses and fuel entries use multiple currencies: {Array.from(new Set(mixedCurrency)).join(", ")}.
+                AutoEco cannot add amounts across currencies. Use a single currency for your {primary?.nickname ?? `${primary?.year ?? ""} ${primary?.brand ?? ""} ${primary?.model ?? ""}`} entries to see totals.
+              </p>
+            </div>
+          )}
+
           <div className="mt-6 grid md:grid-cols-4 gap-3">
             <KPI label="Vehicles" value={vehicles.length.toString()} />
-            <KPI label="Expenses this month" value={usage.expenses.toString()} sub={"of " + ent.maxExpensesPerMonth} />
-            <KPI label="AI chats used" value={usage.aiConversations.toString()} sub={"of " + ent.aiConversationsPerMonth} />
-            <KPI label="Forecast horizon" value={ent.forecastHorizonMonths + " mo"} />
+            <KPI label="Expenses this month" value={usage.expenses.toString()} sub={`of ${ent.maxExpensesPerMonth}`} />
+            <KPI label="AI chats used" value={usage.aiConversations.toString()} sub={`of ${ent.aiConversationsPerMonth}`} />
+            <KPI label="Forecast horizon" value={`${ent.forecastHorizonMonths} mo`} />
           </div>
 
           {primary && summary && (
@@ -60,16 +75,16 @@ export default async function DashboardPage() {
               <div className="flex items-start justify-between flex-wrap gap-3">
                 <div>
                   <p className="label">Primary vehicle</p>
-                  <h2 className="text-xl font-bold mt-1">{primary.nickname ?? (primary.year + " " + primary.brand + " " + primary.model)}</h2>
+                  <h2 className="text-xl font-bold mt-1">{primary.nickname ?? `${primary.year} ${primary.brand} ${primary.model}`}</h2>
                   <p className="text-xs text-charcoal-500">{primary.fuelType} · {primary.transmission ?? "—"} · {primary.fuelEconomyText ?? "—"}</p>
                 </div>
-                <Link href={"/garage/" + primary.id} className="btn btn-secondary text-sm">View vehicle <ChevronRight className="w-4 h-4" /></Link>
+                <Link href={`/garage/${primary.id}`} className="btn btn-secondary text-sm">View vehicle <ChevronRight className="w-4 h-4" /></Link>
               </div>
               <div className="mt-5 grid md:grid-cols-4 gap-3">
-                <KPI label="Monthly cost" value={formatMoney(summary.monthlyAverage, primary.purchaseCurrency ?? "USD")} accent />
-                <KPI label="Cost / km" value={summary.costPerKm != null ? formatMoney(summary.costPerKm, primary.purchaseCurrency ?? "USD") : "—"} />
-                <KPI label="Total spent" value={formatMoney(summary.totalSpent, primary.purchaseCurrency ?? "USD")} />
-                <KPI label="Annual estimate" value={formatMoney(summary.annualEstimate, primary.purchaseCurrency ?? "USD")} />
+                <KPI label="Monthly cost" value={formatMoney(summary.monthlyAverage, summary.baseCurrency)} accent />
+                <KPI label="Cost / km" value={summary.costPerKm != null ? formatMoney(summary.costPerKm, summary.baseCurrency) : "—"} />
+                <KPI label="Total spent" value={formatMoney(summary.totalSpent, summary.baseCurrency)} />
+                <KPI label="Annual estimate" value={formatMoney(summary.annualEstimate, summary.baseCurrency)} />
               </div>
               {summary.breakdown.length > 0 && (
                 <div className="mt-5">
@@ -78,16 +93,16 @@ export default async function DashboardPage() {
                     <div key={b.category} className="mb-2">
                       <div className="flex justify-between text-xs mb-1">
                         <span className="capitalize">{b.category}</span>
-                        <span className="text-charcoal-500">{formatMoney(b.amount, primary.purchaseCurrency ?? "USD")} · {b.percent}%</span>
+                        <span className="text-charcoal-500">{formatMoney(b.amount, summary.baseCurrency)} · {b.percent}%</span>
                       </div>
-                      <div className="progress"><span className="bg-emerald-500" style={{ width: b.percent + "%" }} /></div>
+                      <div className="progress"><span className="bg-emerald-500" style={{ width: `${b.percent}%` }} /></div>
                     </div>
                   ))}
                 </div>
               )}
               <div className="mt-4 flex flex-wrap gap-2 text-xs">
                 <span className="badge badge-info">Actual: {summary.monthsOfData} months</span>
-                <span className="badge badge-info">Distance: {(summary.totalDistance?.toLocaleString() ?? "—") + " " + (primary.currentMileageUnit ?? "km")}</span>
+                <span className="badge badge-info">Distance: {summary.totalDistance?.toLocaleString() ?? "—"} {primary.currentMileageUnit ?? "km"}</span>
                 {summary.missingDistance && <span className="badge badge-warn">No distance data</span>}
               </div>
             </section>
@@ -108,9 +123,9 @@ export default async function DashboardPage() {
 
 function KPI({ label, value, sub, accent }: { label: string; value: string; sub?: string; accent?: boolean }) {
   return (
-    <div className={"card " + (accent ? "bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200/60 dark:border-emerald-700/40" : "")}>
+    <div className={`card ${accent ? "bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200/60 dark:border-emerald-700/40" : ""}`}>
       <p className="label">{label}</p>
-      <p className={"text-2xl font-bold mt-1 " + (accent ? "text-emerald-700 dark:text-emerald-300" : "")}>{value}</p>
+      <p className={`text-2xl font-bold mt-1 ${accent ? "text-emerald-700 dark:text-emerald-300" : ""}`}>{value}</p>
       {sub && <p className="text-xs text-charcoal-500 mt-1">{sub}</p>}
     </div>
   );

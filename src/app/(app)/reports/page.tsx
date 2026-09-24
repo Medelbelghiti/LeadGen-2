@@ -19,8 +19,25 @@ export default async function ReportsPage() {
   }
 
   const v = vehicles[0];
-  const summary = await computeVehicleCost(user.id, v.id);
-  const currency = v.purchaseCurrency ?? "USD";
+  const result = await computeVehicleCost(user.id, v.id);
+
+  if (!result.ok) {
+    return (
+      <div className="max-w-4xl mx-auto p-6">
+        <h1 className="text-2xl font-bold">Reports</h1>
+        <div className="card border-amber-300 bg-amber-50 mt-4">
+          <p className="font-semibold text-amber-800">Mixed-currency data detected</p>
+          <p className="text-sm text-amber-700 mt-1">
+            Currencies present: {Array.from(new Set(result.currencies)).join(", ")}.
+            AutoEco cannot aggregate totals across currencies. Edit your entries to use a single currency to view this report.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const summary = result.summary;
+  const currency = summary.baseCurrency;
   const dep = v.purchasePriceCents ? computeDepreciation({
     purchasePriceCents: v.purchasePriceCents,
     purchaseDate: v.purchaseDate ?? new Date(),
@@ -31,7 +48,7 @@ export default async function ReportsPage() {
     purchasePriceCents: v.purchasePriceCents,
     purchaseDate: v.purchaseDate ?? new Date(),
     estimatedResaleCents: v.estimatedResaleCents,
-    monthlyFixedCents: 10000,
+    forwardLookingFixedCents: 0,
   }, 36) : null;
 
   return (
@@ -91,6 +108,9 @@ export default async function ReportsPage() {
             {trueCost.breakdown.map((b) => (
               <li key={b.label}><span className="badge badge-info mr-2">{b.source}</span>{b.label}: <strong>{formatMoney(b.cents, currency)}</strong></li>
             ))}
+          </ul>
+          <ul className="mt-3 space-y-1 text-xs text-charcoal-400">
+            {trueCost.assumptions.map((a, i) => <li key={i}>· {a}</li>)}
           </ul>
         </section>
       )}
