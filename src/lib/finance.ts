@@ -26,18 +26,16 @@ export const ALLOWED_CATEGORIES: Category[] = [
   "accessories", "financing", "charging", "other",
 ];
 
-export const ALLOWED_CURRENCIES = ["USD", "EUR", "MAD", "GBP", "CAD"] as const;
-export type SupportedCurrency = typeof ALLOWED_CURRENCIES[number];
+// Re-export from the canonical location so existing imports keep working.
+export { SUPPORTED_CURRENCIES as ALLOWED_CURRENCIES, type SupportedCurrency, isSupportedCurrency } from "./currency";
+import { isSupportedCurrency as _isc } from "./currency";
+const isSupportedCurrency = _isc;
 
 export const ALLOWED_DISTANCE_UNITS = ["km", "mi"] as const;
 export type DistanceUnit = typeof ALLOWED_DISTANCE_UNITS[number];
 
 export const ALLOWED_FUEL_UNITS = ["L_PER_100KM", "KM_PER_L", "MPG"] as const;
 export type FuelEconomyUnit = typeof ALLOWED_FUEL_UNITS[number];
-
-export function isSupportedCurrency(v: unknown): v is SupportedCurrency {
-  return typeof v === "string" && (ALLOWED_CURRENCIES as readonly string[]).includes(v);
-}
 
 export interface RawExpense {
   amountCents: number;

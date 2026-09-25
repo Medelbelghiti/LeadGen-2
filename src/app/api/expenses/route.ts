@@ -6,12 +6,13 @@ import { db } from "@/lib/db";
 import { getEntitlements, LimitReachedError } from "@/lib/plans";
 import { getMonthlyUsage } from "@/lib/usage";
 import { assertOwnership } from "@/lib/auth";
+import { SUPPORTED_CURRENCIES } from "@/lib/currency";
 
 const ExpenseSchema = z.object({
   vehicleId: z.string().min(1),
   category: z.enum(["fuel","maintenance","repair","insurance","tax","registration","tires","parking","tolls","cleaning","accessories","financing","charging","other"]),
   amountCents: z.number().int().min(1).max(100_000_000),
-  currency: z.string().min(3).max(3),
+  currency: z.enum(SUPPORTED_CURRENCIES),
   date: z.string().min(1),
   merchant: z.string().max(120).nullable().optional(),
   mileage: z.number().int().min(0).nullable().optional(),

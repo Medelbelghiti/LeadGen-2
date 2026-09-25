@@ -159,9 +159,14 @@ model WebhookEvent {
   id          String    @id @default(cuid())
   eventId     String    @unique
   type        String
+  // State machine: RECEIVED → PROCESSING → PROCESSED | FAILED.
+  // Default for existing rows: PROCESSED if processedAt is set, else RECEIVED.
+  status      String    @default("RECEIVED")
+  attempts    Int       @default(0)
   processedAt DateTime?
   error       String?
   createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 }
 
 model Coupon {

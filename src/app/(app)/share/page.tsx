@@ -25,7 +25,9 @@ async function PublicReport({ token }: { token: string }) {
     return <Error msg="Owner data is temporarily unavailable or contains mixed currencies." />;
   }
   const summary = result.summary;
-  const currency = primary.purchaseCurrency ?? "USD";
+  // CRITICAL: use the financial summary's authoritative base currency, NOT
+  // vehicle.purchaseCurrency (which can differ from the actual recorded data).
+  const currency = summary.baseCurrency;
   const dep = primary.purchasePriceCents ? computeDepreciation({
     purchasePriceCents: primary.purchasePriceCents,
     purchaseDate: primary.purchaseDate ?? new Date(),

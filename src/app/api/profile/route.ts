@@ -3,11 +3,12 @@ import { z } from "zod";
 import { withErrorHandling, parseJson, ok } from "@/lib/http";
 import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { SUPPORTED_CURRENCIES } from "@/lib/currency";
 
 const UpdateSchema = z.object({
   name: z.string().min(1).max(80).optional(),
   locale: z.enum(["en", "fr"]).optional(),
-  currency: z.string().min(3).max(3).optional(),
+  currency: z.enum(SUPPORTED_CURRENCIES).optional(),
   distanceUnit: z.enum(["km", "mi"]).optional(),
   fuelUnit: z.enum(["L_PER_100KM", "MPG", "KM_PER_L"]).optional(),
 });

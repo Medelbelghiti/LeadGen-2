@@ -4,7 +4,7 @@ import { withErrorHandling, parseJson, ok } from "@/lib/http";
 import { requireUser, assertOwnership } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { computeFuelConsumption } from "@/lib/compute-cost";
-import { isSupportedCurrency } from "@/lib/finance";
+import { isSupportedCurrency, SUPPORTED_CURRENCIES } from "@/lib/currency";
 
 const FuelSchema = z.object({
   vehicleId: z.string().min(1),
@@ -14,7 +14,7 @@ const FuelSchema = z.object({
   liters: z.number().min(0).max(10000).nullable().optional(),
   kwh: z.number().min(0).max(10000).nullable().optional(),
   amountCents: z.number().int().min(1),
-  currency: z.string().min(3).max(3),
+  currency: z.enum(SUPPORTED_CURRENCIES),
   pricePerUnit: z.number().min(0).nullable().optional(),
   fullTank: z.boolean().optional(),
   station: z.string().max(120).nullable().optional(),
