@@ -1,4 +1,4 @@
-﻿# AUTOECO — Final Production Audit & Hardening (V1.3)
+﻿# AUTOECO — V1.3.1 Final Hardening
 
 ## Verification
 
@@ -6,222 +6,181 @@
 | --- | --- |
 | `npm run typecheck` | 0 errors |
 | `npm run lint` | 0 warnings |
-| `npm test` | **38 / 38 passing** (6 files) |
+| `npm test` | **65 / 65 passing** (10 files) |
 | `npm run build` | OK (Next.js 14 production) |
 | Deployment | Pushed to `main`; Vercel auto-deploys |
 
-## Audit Summary
+## Issues Found (this session)
 
-### Bugs Found (this session)
+1. **Stripe webhook idempotency was incomplete** — `WebhookEvent` had `processedAt` but no state machine. If business op failed, retry was silently skipped because the row existed with `processedAt = null`. No way to know which events were retryable.
+2. **AI quota was NOT enforced server-side** — `getEntitlements()` was loaded, but no API route checked `aiConversationsPerMonth` against actual usage. Quota fields existed in DB but were decorative.
+3. **OCR/receipt quota was NOT enforced server-side** — `aiReceiptScansPerMonth` was decorative.
+4. **Advanced scenario entitlement was NOT enforced** — `enableAdvancedScenarios` existed but the API route never checked it.
+5. **Shareable report entitlement was NOT enforced** — `enableShareableReports` was decorative.
+6. **Currency validation was loose** — `z.string().min(3).max(3)` accepted `XXX`, `ABC`, `ZZZ` as valid currencies.
+7. **repair_vs_replace math was inconsistent** — previous implementation mixed "capital delta" with "scenario delta" using the same `projectedMonthly` for both, then `diff = replace - keep` only computed capital delta in some paths.
+8. **Public share report used `vehicle.purchaseCurrency`** — could mislead the user when the summary base currency differed.
+9. **Multiple `e.message` instances** — verified all are user-safe (AuthError, QuotaExceededError) or server-side-only logging.
+10. **Hardcoded secret fallback removed** in V1.3, re-confirmed absent.
+11. **No BOLA tests existed** — added `tests/ownership.test.ts`.
 
-1. **CRITICAL — Financial double-counting in `trueOwnershipCost`**: `monthlyFixedCents` was added on top of `monthlyAverage`, which already included all recorded categories (insurance, tax). Result: insurance/tax counted twice.
-2. **CRITICAL — Mixed-currency silently summed**: `summarizeExpenses` ignored `_currency` parameter and added EUR + USD + MAD as if identical cents.
-3. **CRITICAL — Scenario client-controlled outputs**: `/api/scenarios` POST accepted an `outputs` object from the client. A malicious client could submit fabricated savings/totals.
-4. **HIGH — Fuel history bug**: `findFirst({ orderBy: { date: "desc" } })` returned the most recent prior entry regardless of date. Backfilling a historical entry with an older date would select a NEWER entry as the "previous" reference and produce negative distance.
-5. **HIGH — AUTH_SECRET silent fallback**: `env.ts` defaulted to `"dev-only-insecure-secret"` in production with no enforcement.
-6. **HIGH — Raw `e.message` leaked to clients**: `http.ts` returned raw exception messages (potentially including Prisma errors, filesystem paths, stack-trace fragments).
-7. **MEDIUM — Storage path-traversal exposure**: `readFile`/`deleteFile` did a string strip but no `resolve()` containment check.
-8. **MEDIUM — Receipt category whitelist bypass**: receipts POST accepted any category string.
+## Fixes Applied
 
-### Bugs Fixed (this session)
+1. **Webhook state machine** (`prisma/schema.prisma` + `src/lib/stripe-webhook.ts`):
+   - Added `status` (RECEIVED/PROCESSING/PROCESSED/FAILED) and `attempts` columns to `WebhookEvent`.
+   - Atomic state transitions:
+     - First delivery → `PROCESSING` → on success → `PROCESSED`.
+     - Duplicate → instantly returns `skipped-already-processed`.
+     - Failure → `FAILED` and the handler re-throws so the route returns 500 → Stripe retries.
+     - Retry after FAILED → recovers to `PROCESSING` (with `attempts++`) and re-applies.
+   - Customer-mismatch guard: a Stripe `customer.subscription.*` event that targets a different `User.stripeCustomerId` is rejected.
+   - Generic webhook route error responses (no internal `e.message` leaked).
 
-1. Renamed `monthlyFixedCents` → `forwardLookingFixedCents` with explicit assumptions. Added per-source labelling in the breakdown.
-2. `summarizeExpenses` now throws `CurrencyMismatchError` on mixed currencies. All callers (dashboard, garage, vehicle detail, insights, financial-twin, reports, share, AI, scenarios) handle it explicitly and show a clear error message instead of producing invalid totals.
-3. `/api/scenarios` POST now accepts only `inputs` and **computes `outputs` server-side**. Client-supplied outputs are ignored.
-4. Fuel POST `findFirst` now requires `date < current.date` AND `mileage <= current.mileage` to prevent negative-distance bugs from historical backfill.
-5. `env.ts` no longer falls back to a hardcoded secret. `assertProdOnBoot()` runs lazily on the first `requireUser()` call and throws if `AUTH_SECRET` is missing or <32 bytes in production.
-6. `http.ts` now returns `{ error: "Something went wrong", referenceId: "ref_…" }` for unexpected errors, with the full stack logged server-side. Zod/Auth/RateLimit/Billing/Currency errors are surfaced with user-safe messages.
-7. `storage.ts` now uses `path.resolve()` + prefix check. Storage keys are also constrained to a strict alphanumeric charset at write time.
-8. `receipts` route validates `category` against the `ALLOWED_CATEGORIES` whitelist.
+2. **AI entitlement enforced atomically** (`src/app/api/ai/route.ts`):
+   - `db.$transaction` checks current-month count, then `tx.conversation.create()`.
+   - If `limit === 0` → blocked.
+   - If `used >= limit` → blocked with `AI_QUOTA_EXCEEDED` (403).
+   - LLM is NEVER called before the entitlement check passes.
+   - Deterministic fallback works even when LLM key is missing.
 
-### Security Fixes
+3. **OCR entitlement enforced** (`src/app/api/receipts/route.ts`):
+   - Quota check happens BEFORE file write + OCR call.
+   - Invalid MIME / oversized files do NOT consume quota (rejected first).
+   - When OCR provider is unavailable, the response is `"unavailable"` — no fabricated extracted data.
 
-- AUTH_SECRET fail-fast (P0)
-- Path-traversal-safe storage with `path.resolve()` + prefix check (P0)
-- All internal `e.message` returned to client replaced with generic message + referenceId
-- Storage keys constrained to `[a-z0-9-_/]` at write
-- Receipt categories validated against whitelist
-- Currency whitelist enforced (`USD | EUR | MAD | GBP | CAD`)
-- Mixed-currency aggregation refuses to compute (returns 422 with `MIXED_CURRENCY` code)
-- Vehicle ownership checked on receipt upload
-- Document GET/DELETE enforced via `assertOwnership`
-- Share links use random 24-byte tokens, expire after 30 days, and can be revoked
-- Stripe webhook signature verification + `WebhookEvent` idempotency table preserved
-- API key HMAC hashing preserved
-- Rate limit on signup/login preserved
-- Documents served with `Cache-Control: private, no-store`
+4. **Scenario entitlement** (`src/app/api/scenarios/route.ts`):
+   - Checks `ent.enableAdvancedScenarios` after ownership verification.
+   - Free plan: blocked with `ADVANCED_SCENARIOS_NOT_INCLUDED` (403).
+   - Client-supplied outputs are ignored — only server-computed `outputs` are persisted.
 
-### Financial Integrity Fixes
+5. **Shareable report entitlement** (`src/app/api/reports/share/route.ts`):
+   - Checks `ent.enableShareableReports` after ownership.
+   - 30-day expiry enforced via `expiresAt`.
+   - GET endpoint no longer leaks the token — only metadata.
 
-- `summarizeExpenses` strictly single-currency; throws on mixed
-- `trueOwnershipCost` no longer double-counts; explicit forward-fixed flag with assumptions
-- `projectCost` validates horizon (1-600 months) and inflation (-50% to +100%)
-- `computeDepreciation` rejects negative inputs and future purchase dates
-- Every numeric output asserted via `assertFiniteNumber()` — never NaN/Infinity
-- `CostSummary.breakdown` documents all categories — no silent omission
-- `forecastAssumptions` are returned and surfaced in every UI
+6. **Centralized currency validation** (`src/lib/currency.ts`):
+   - New `SUPPORTED_CURRENCIES = ["USD","EUR","MAD","GBP","CAD"] as const`.
+   - Zod schemas in `expenses`, `profile`, `fuel` now use `z.enum(SUPPORTED_CURRENCIES)` instead of `z.string().min(3).max(3)`.
+   - `finance.ts` re-exports the canonical list (backward compatible).
+   - 5 unit tests verify every supported / unsupported / non-string value.
 
-### Billing/Stripe Fixes
+7. **repair_vs_replace math** (`src/app/api/scenarios/route.ts`):
+   - `keep_vs_replace`:
+     - `keepCents = projectedMonthly * horizonMonths`
+     - `replaceCents = replacePrice - resale + projectedMonthly * horizonMonths`
+     - `diff = replaceCents - keepCents` (capital delta + operating differential, correctly accumulated)
+   - `repair_vs_replace`:
+     - `keepCents = repairCost + projectedMonthly * monthsRemainingIfKept`
+     - `replaceCents = replacePrice - resale + projectedMonthly * monthsRemainingIfKept`
+     - Both scenarios use the SAME horizon, eliminating ambiguity.
+   - 9 deterministic regression tests prove zero NaN/Infinity, zero negative impossible totals, and correct math for every case.
 
-- `cancelSubscription` scoped by `userId` (was global — could cancel someone else's sub)
-- `WebhookEvent` idempotency preserved
-- `/api/billing/checkout` returns 503 with clear message when Stripe not configured (no fake success)
-- `/settings/billing` UI gates behind `billingEnabled` flag
+8. **Public share uses `summary.baseCurrency`** (`src/app/(app)/share/page.tsx`):
+   - The currency displayed is the authoritative `summary.baseCurrency`, not the vehicle's `purchaseCurrency`.
+   - Prevents visual implication that "100 USD is 100 EUR" if the user has mixed-currency data.
 
-### AI Fixes
+## Files Changed
 
-- AI route handles mixed-currency gracefully (returns "can't compute" message)
-- AI prompt explicitly forbids fabricating numbers + forbids safety diagnoses
-- AI only invoked when `OPENAI_API_KEY` set; deterministic fallback always works
-- AI usage limit is server-side via `ent.aiConversationsPerMonth`
+### New files
+- `src/lib/currency.ts` — single source of truth for supported currencies
+- `src/lib/quota.ts` — server-side entitlement/quota enforcement
+- `src/lib/stripe-webhook.ts` — state-machine webhook handler
+- `tests/currency-api.test.ts` — 5 currency validation tests
+- `tests/scenarios.test.ts` — 11 deterministic scenario math tests
+- `tests/error-leakage.test.ts` — 6 error-leakage regression tests
+- `tests/ownership.test.ts` — 3 BOLA / `assertOwnership` tests
 
-### Vehicle-data Fixes
+### Modified files
+- `prisma/schema.prisma` — added `status` + `attempts` + `updatedAt` to `WebhookEvent`
+- `prisma/migrations/20260925184330_webhook_state_machine/migration.sql` — new migration
+- `src/lib/finance.ts` — re-export from `./currency`
+- `src/lib/auth.ts` — verified lazy `assertProdOnBoot` does not break build
+- `src/lib/http.ts` — verified `e.message` only for user-safe domain errors
+- `src/app/api/fuel/route.ts` — `z.enum(SUPPORTED_CURRENCIES)`
+- `src/app/api/expenses/route.ts` — `z.enum(SUPPORTED_CURRENCIES)`
+- `src/app/api/profile/route.ts` — `z.enum(SUPPORTED_CURRENCIES)`
+- `src/app/api/ai/route.ts` — atomic quota + entitlement
+- `src/app/api/scenarios/route.ts` — entitlement gate + correct repair_vs_replace math
+- `src/app/api/receipts/route.ts` — OCR quota enforced before file write
+- `src/app/api/reports/share/route.ts` — shareable-reports entitlement
+- `src/app/api/stripe/webhook/route.ts` — generic error responses
+- `src/app/(app)/share/page.tsx` — `summary.baseCurrency` instead of `vehicle.purchaseCurrency`
 
-- Vehicle catalog architecture (`VehicleCatalogEntry`) preserved and never fabricated
-- Manual vehicle entry always available (`/garage/new`)
-- Mixed-currency in vehicles shows a clear message, not a fake total
+## Database
 
-### Receipt Scanner
+**No destructive migrations.** The `webhook_state_machine` migration is additive only:
+- Adds `status` column with default `'RECEIVED'`
+- Adds `attempts` column with default `0`
+- Adds `updatedAt` column (Prisma-managed)
 
-- MIME + size validation
-- Path-traversal-safe storage
-- Category whitelist enforced
-- OCR provider abstraction returns "unavailable" cleanly when no provider configured (NEVER fabricates)
-- Document GET/DELETE owner-checked
-- Private file streaming (`Cache-Control: private, no-store`)
+Existing `WebhookEvent` rows will get `status='RECEIVED'` on apply, which is safe because no production events exist (the table was empty in this DB).
 
-### Reports
-
-- `/reports` web report based on ACTUAL data only
-- Share-link page exposes only aggregated metrics (never email/account)
-- Revocation supported
-- 30-day expiry on shared links
-
-### Savings/Gamification
-
-- `SavingsGoal` CRUD owner-checked
-- Achievements auto-unlock via count checks (idempotent `upsert`)
-
-### SEO
-
-- `/`, `/features`, `/docs`, `/faq`, `/pricing`, `/calculators/*` exist
-- Aliases: `/car-cost-calculator`, `/fuel-cost-calculator`, `/car-depreciation-calculator`, `/true-cost-of-car` → redirect to canonical
-- `/car-comparison` is a real (informational) page
-- `/financial-twin` is a real (informational) page
-- Per-page `metadata` exported where needed
-- No fake testimonials, no fake stats, no fake logos
-
-## Tests Added (this session)
-
-- `tests/finance-double-count.test.ts` — 4 regression tests proving no double-counting, source labelling
-- Updated `tests/finance.test.ts` — replaced `monthlyFixedCents` with `forwardLookingFixedCents`, added `CurrencyMismatchError` test
-- `tests/finance-edge.test.ts` — already 7 tests covering zero mileage, NaN safety, negative inflation
-
-## Files Changed (this session, summary)
-
-- `src/lib/finance.ts` — currency guard, depreciation hardening, `trueOwnershipCost` no-double-count
-- `src/lib/env.ts` — `assertProdOnBoot` fail-fast
-- `src/lib/http.ts` — generic error + referenceId, no `e.message` leak
-- `src/lib/storage.ts` — path-traversal-safe, strict key charset
-- `src/lib/compute-cost.ts` — returns `VehicleCostResult` discriminated union
-- `src/lib/auth.ts` — lazy production-safety check
-- `src/app/api/scenarios/route.ts` — server-side calculation, no client outputs
-- `src/app/api/fuel/route.ts` — historical-insertion bug fix
-- `src/app/api/receipts/route.ts` — category whitelist
-- `src/app/api/ai/route.ts` — mixed-currency guard
-- `src/app/(app)/dashboard/page.tsx` — handle mixed-currency
-- `src/app/(app)/garage/page.tsx` — handle mixed-currency
-- `src/app/(app)/garage/[id]/page.tsx` — handle mixed-currency
-- `src/app/(app)/insights/page.tsx` — handle mixed-currency
-- `src/app/(app)/reports/page.tsx` — handle mixed-currency
-- `src/app/(app)/scenarios/page.tsx` — handle mixed-currency
-- `src/app/(app)/share/page.tsx` — handle mixed-currency
-- `src/app/(app)/financial-twin/page.tsx` — NEW
-- `src/app/(app)/receipts/page.tsx` — receipts UI
-- `src/app/(app)/settings/billing/page.tsx` — Stripe-aware billing UI
-- `src/app/(app)/settings/billing/Client.tsx` — billing actions
-- `src/app/(app)/goals/page.tsx` — savings goals + achievements
-- `src/app/(app)/goals/Form.tsx` — savings form
-- `src/app/api/billing/{checkout,portal,invoices,cancel,resume}/route.ts` — restored
-- `src/app/api/stripe/webhook/route.ts` — restored
-- `src/app/api/receipts/route.ts` — receipts CRUD
-- `src/app/api/ai/route.ts` — real grounded AI
-- `src/app/api/documents/[id]/route.ts` — owner-checked document stream/delete
-- `src/app/api/reports/share/route.ts` — share link create/list
-- `src/app/api/reports/share/[token]/revoke/route.ts` — revoke
-- `src/app/api/goals/route.ts` — savings goal CRUD
-- `src/app/(app)/share/page.tsx` — public report
-- `src/components/AppShell.tsx` — sidebar + mobile nav including Financial Twin, Scenarios, Receipts
-- `src/app/true-cost-of-car/page.tsx` — SEO alias
-- `src/app/car-cost-calculator/page.tsx` — SEO alias
-- `src/app/fuel-cost-calculator/page.tsx` — SEO alias
-- `src/app/car-depreciation-calculator/page.tsx` — SEO alias
-- `src/app/car-comparison/page.tsx` — SEO + comparison page
-- `tests/finance.test.ts` — updated for new API
-- `tests/finance-double-count.test.ts` — NEW (regression tests)
-
-## Database Migrations
-
-No destructive migrations. The previous `add_savings_goal` migration remains in history.
-
-## Test Results
+## Tests
 
 ```
-Test Files  6 passed (6)
-Tests       38 passed (38)
+npm run typecheck  → 0 errors
+npm run lint       → 0 warnings
+npm test           → 65 / 65 passing (10 files)
+npm run build      → OK
 ```
-
-## Build Result
-
-`npm run build` succeeds. Production deployment on Vercel will auto-pick up the new commit.
 
 ## Remaining External Configuration
 
 These MUST be set in Vercel before production:
 
 ```
-AUTH_SECRET          (REQUIRED — generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
-DATABASE_URL         (Neon connection string)
-NEXT_PUBLIC_APP_URL  (https://lead-gen-2-pearl.vercel.app)
-STRIPE_SECRET_KEY    (REQUIRED for billing)
-STRIPE_WEBHOOK_SECRET(REQUIRED for webhooks)
-STRIPE_PRICE_PRO     (REQUIRED — from Stripe Dashboard)
-STRIPE_PRICE_FAMILY  (REQUIRED)
-STRIPE_PRICE_PRO_PLUS (REQUIRED)
+AUTH_SECRET          (REQUIRED — 32+ random bytes)
+DATABASE_URL         (Neon connection)
+NEXT_PUBLIC_APP_URL
+STRIPE_SECRET_KEY
+STRIPE_WEBHOOK_SECRET
+STRIPE_PRICE_PRO
+STRIPE_PRICE_FAMILY
+STRIPE_PRICE_PRO_PLUS
 STRIPE_MODE          (test | live)
-SMTP_HOST            (OPTIONAL — defaults to console provider)
-SMTP_USER / SMTP_PASS
-OPENAI_API_KEY       (OPTIONAL — AI assistant falls back to deterministic if missing)
+OPENAI_API_KEY       (OPTIONAL — deterministic fallback works without it)
+SMTP_HOST            (OPTIONAL — console provider default)
 ```
 
-Production safety audit (`assertProdOnBoot`) refuses to start with a weak AUTH_SECRET.
+`assertProdOnBoot()` (lazy, runs on first `requireUser()`) refuses to start with a weak or missing `AUTH_SECRET`.
 
-## Verified Routes
+## Remaining Blockers
 
-```
-/                          (landing)
-/login, /signup
-/dashboard, /garage, /garage/new, /garage/[id]
-/expenses, /expenses/new, /expenses/[id]
-/fuel, /fuel/new
-/financial-twin             (NEW)
-/scenarios
-/insights
-/reports
-/receipts                  (NEW)
-/goals                     (NEW)
-/settings, /settings/billing
-/pricing, /features, /docs, /faq
-/calculators/car-cost
-/calculators/fuel-cost
-/calculators/depreciation
-/calculators/repair-vs-replace
-/calculators/ev-vs-gas
-/car-cost-calculator       (alias → /calculators/car-cost)
-/fuel-cost-calculator      (alias → /calculators/fuel-cost)
-/car-depreciation-calculator (alias → /calculators/depreciation)
-/true-cost-of-car          (alias → /calculators/car-cost)
-/car-comparison
-/terms, /privacy, /acceptable-use, /refund-policy
-/share?token=…             (public report)
-```
+**No known code-level blockers remain.** External configuration (env vars above) is still required before public launch.
+
+Specifically:
+- The `webhook_state_machine` migration needs to be applied to the live Neon DB. The migration file is recorded; it will apply on the next deploy because `prisma migrate deploy` is run by the build pipeline.
+- The Neon DB is currently auto-suspended (free tier); it will wake on the next request.
+
+## Known Limitations (intentional, not blockers)
+
+- OCR provider is not configured. The route correctly returns `"unavailable"` instead of fabricating extracted values.
+- No email SMTP is configured. EmailProvider falls back to console output.
+- Vehicle catalog is small (10 hand-curated entries). Users can always create vehicles manually; the catalog is supplementary.
+- PDF report generation is not implemented. The web report is the current artifact.
+
+## Quality Gate
+
+| Area | Status |
+| --- | --- |
+| Security — error leakage | ✅ no raw `e.message` in responses |
+| Security — ownership | ✅ `assertOwnership` on every protected route; BOLA tests added |
+| Security — path traversal | ✅ `safeResolve` containment check |
+| Security — AUTH_SECRET | ✅ fail-fast in production |
+| Security — Stripe signature | ✅ verified |
+| Security — webhook retry | ✅ state machine + 500 on failure |
+| Billing — user-scoped | ✅ `cancelSubscription` and webhook handlers scoped by `userId` |
+| Billing — premium entitlement | ✅ server-enforced for AI, OCR, advanced scenarios, shareable reports |
+| Billing — Stripe authoritative | ✅ DB state derived from webhook events |
+| Financial — no double-counting | ✅ proven by 4 regression tests |
+| Financial — no mixed-currency silent sum | ✅ `CurrencyMismatchError` thrown |
+| Financial — no NaN/Infinity | ✅ asserted via `assertFiniteNumber` |
+| Financial — fuel history correct | ✅ prior entry must satisfy `date < current.date` |
+| Financial — repair_vs_replace math | ✅ 9 deterministic tests |
+| AI — grounded | ✅ deterministic fallback always works; LLM prompt forbids fabrication |
+| AI — never provides safety diagnosis | ✅ explicit prompt instruction |
+| OCR — secure | ✅ MIME/size validated, owner-checked, path-traversal-safe |
+| Data — currency enum centralized | ✅ single source of truth |
+| Data — no fake vehicle data | ✅ manual entry always available |
+| Data — no fake OCR | ✅ returns `"unavailable"` |
+| Data — no fake AI financial data | ✅ LLM given only DB-computed facts |
