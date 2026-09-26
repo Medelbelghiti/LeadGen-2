@@ -290,6 +290,12 @@ model Vehicle {
 
   @@index([userId, archived])
   @@index([userId, isPrimary])
+
+  // Strongly-typed server-side quota rows. Concurrency-safe via UNIQUE
+  // (userId, metric, periodKey) + atomic increment (UPDATE ... SET used = used + 1
+  // WHERE used < limit). The check + increment happens in a single statement
+  // so 100 concurrent AI requests against limit=10 cannot exceed 10.
+  // Missing rows are auto-created on first consumption (upsert-style).
 }
 
 // ----------------------------- Expenses -----------------------------
@@ -580,4 +586,22 @@ model SavingsGoal {
   updatedAt   DateTime @updatedAt
 
   @@index([userId, achievedAt])
+}
+
+// ----------------------------- Quota usage -----------------------------
+// Authoritative per-user, per-metric, per-period counter.
+// Concurrency-safe via UNIQUE (userId, metric, periodKey) and an atomic
+// "UPDATE ... SET used = used + 1 WHERE used < limit" pattern that
+// guarantees the limit is never exceeded even under heavy parallelism.
+model QuotaUsage {
+  id        String   @id @default(cuid())
+  userId    String
+  metric    String   // "ai_conversations" | "ocr_scans" | "expenses"
+  periodKey String   // "YYYY-MM" (or "trial:<userId>")
+  used      Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, metric, periodKey])
+  @@index([periodKey])
 }

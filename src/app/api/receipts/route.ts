@@ -2,10 +2,11 @@
 import { withErrorHandling, ok } from "@/lib/http";
 import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { saveFile, validateUpload } from "@/lib/storage";
+import { saveFile, deleteFile, validateUpload } from "@/lib/storage";
 import { getOcrProvider } from "@/lib/ocr";
 import { ALLOWED_CATEGORIES, normalizeCategory } from "@/lib/finance";
-import { getEntitlements, QuotaExceededError } from "@/lib/quota";
+import { getEntitlements } from "@/lib/plans";
+import { buildPeriodKey, tryConsume, release } from "@/lib/quota";
 
 export const GET = withErrorHandling(async () => {
   const user = await requireUser();
@@ -25,45 +26,74 @@ export const POST = withErrorHandling(async (req) => {
   const category = ALLOWED_CATEGORY_SET.has(categoryRaw) ? categoryRaw : "other";
   void normalizeCategory;
 
+  // 1. File validation (rejects BEFORE quota consumption).
   if (!(file instanceof File)) return NextResponse.json({ error: "Missing file" }, { status: 400 });
   const err = validateUpload(file);
   if (err) return NextResponse.json({ error: err }, { status: 400 });
 
+  // 2. Vehicle ownership check.
   const vehicleId = typeof vehicleIdRaw === "string" ? vehicleIdRaw : null;
   if (vehicleId) {
     const v = await db.vehicle.findUnique({ where: { id: vehicleId } });
     if (!v || v.userId !== user.id) return NextResponse.json({ error: "Vehicle not found" }, { status: 404 });
   }
 
-  // 1. Validate entitlement + quota BEFORE doing any expensive work.
-  // Only count against OCR quota when OCR is actually available.
+  // 3. Authoritative entitlement.
   const ent = await getEntitlements(user);
+  const periodKey = buildPeriodKey(new Date(), { trial: ent.isTrial, userId: user.id });
   const ocrAvailable = getOcrProvider().available;
+
+  // 4. Atomic quota reservation. Only run if OCR is actually available
+  //    (otherwise we don't want to "consume" OCR quota for manual uploads).
+  let reservation:
+    | { kind: "reserved" }
+    | { kind: "skipped" }
+    | { kind: "denied" } = { kind: "skipped" };
   if (ocrAvailable) {
-    const period = ent.periodKey.startsWith("trial:") ? "trial" : new Date().toISOString().slice(0, 7);
-    const used = await db.expense.count({
-      where: { userId: user.id, source: "receipt_scan", date: { gte: new Date(period === "trial" ? 0 : Date.parse(period + "-01")) } },
+    const r = await tryConsume({
+      userId: user.id,
+      metric: "ocr_scans",
+      periodKey,
+      limit: ent.aiReceiptScansPerMonth,
     });
-    const limit = ent.aiReceiptScansPerMonth;
-    if (limit === 0) throw new QuotaExceededError("aiScans", "Receipt scanning is not included in your plan");
-    if (used >= limit) throw new QuotaExceededError("aiScans", `Monthly receipt-scan limit reached (${limit})`);
+    if (!r.allowed) {
+      return NextResponse.json(
+        {
+          error: ent.aiReceiptScansPerMonth === 0
+            ? "Receipt scanning is not included in your plan"
+            : `Monthly OCR limit reached (${ent.aiReceiptScansPerMonth})`,
+          code: "OCR_QUOTA_EXCEEDED",
+        },
+        { status: 403 }
+      );
+    }
+    reservation = { kind: "reserved" };
   }
 
-  // 2. Safe file write
+  // 5. Safe file write.
   const bytes = Buffer.from(await file.arrayBuffer());
   const ext = (file.name.split(".").pop() ?? "bin").toLowerCase();
   const prefix = vehicleId ? `receipts/${vehicleId}` : `receipts/user/${user.id}`;
-  const { storageKey, sizeBytes } = await saveFile(prefix, ext, bytes);
+  let stored: { storageKey: string; sizeBytes: number };
+  try {
+    stored = await saveFile(prefix, ext, bytes);
+  } catch (e) {
+    // File write failed — release quota if we reserved it.
+    if (reservation.kind === "reserved") {
+      await release({ userId: user.id, metric: "ocr_scans", periodKey }).catch(() => {});
+    }
+    throw e;
+  }
 
-  // 3. OCR (if provider available)
+  // 6. OCR call.
   const ocr = await getOcrProvider().extract({ bytes, mimeType: file.type });
-  const title = typeof titleRaw === "string" && titleRaw.length > 0 ? titleRaw : (file.name || "Receipt");
 
-  // 4. Persist
+  // 7. Persist document.
+  const title = typeof titleRaw === "string" && titleRaw.length > 0 ? titleRaw : (file.name || "Receipt");
   const doc = await db.document.create({
     data: {
       userId: user.id, vehicleId, title, category,
-      storageKey, mimeType: file.type, sizeBytes,
+      storageKey: stored.storageKey, mimeType: file.type, sizeBytes: stored.sizeBytes,
     },
   });
 

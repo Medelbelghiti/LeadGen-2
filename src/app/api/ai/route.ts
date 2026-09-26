@@ -4,7 +4,8 @@ import { requireUser } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { computeVehicleCost } from "@/lib/compute-cost";
 import { formatMoney, projectCost, type CostSummary } from "@/lib/finance";
-import { getEntitlements, QuotaExceededError } from "@/lib/quota";
+import { getEntitlements } from "@/lib/plans";
+import { buildPeriodKey, tryConsume, type QuotaMetric } from "@/lib/quota";
 
 interface ChatMsg { role: "system" | "user" | "assistant"; content: string; }
 
@@ -14,87 +15,109 @@ export const POST = withErrorHandling(async (req) => {
   const question = String(body?.question ?? body?.q ?? "").trim();
   if (!question) return NextResponse.json({ error: "Missing question" }, { status: 400 });
 
-  // 1. Load authoritative entitlements
+  // 1. Authoritative entitlement
   const ent = await getEntitlements(user);
+  const periodKey = buildPeriodKey(new Date(), { trial: ent.isTrial, userId: user.id });
+  const metric: QuotaMetric = "ai_conversations";
 
-  // 2. Atomic quota check + increment via DB transaction
-  // The conversation record is created inside the same transaction as the quota check.
-  let createdConversationId: string;
-  try {
-    createdConversationId = await db.$transaction(async (tx) => {
-      const period = ent.periodKey.startsWith("trial:") ? "trial" : new Date().toISOString().slice(0, 7);
-      const used = await tx.conversation.count({
-        where: { userId: user.id, createdAt: { gte: new Date(period === "trial" ? 0 : Date.parse(period + "-01")) } },
-      });
-      const limit = ent.aiConversationsPerMonth;
-      if (limit === 0) throw new QuotaExceededError("aiConversations", "AI conversations are not included in your plan");
-      if (used >= limit) throw new QuotaExceededError("aiConversations", `Monthly AI limit reached (${limit})`);
-      const conv = await tx.conversation.create({ data: { userId: user.id } });
-      return conv.id;
-    });
-  } catch (e) {
-    if (e instanceof QuotaExceededError) {
-      return NextResponse.json({ error: e.message, code: "AI_QUOTA_EXCEEDED" }, { status: 403 });
-    }
-    throw e;
+  // 2. Atomic quota reservation. If this returns allowed=false, no DB writes
+  // happened — the request is rejected without side effects.
+  const consumption = await tryConsume({
+    userId: user.id,
+    metric,
+    periodKey,
+    limit: ent.aiConversationsPerMonth,
+  });
+
+  if (!consumption.allowed) {
+    return NextResponse.json({
+      error: ent.aiConversationsPerMonth === 0
+        ? "AI conversations are not included in your plan"
+        : `Monthly AI limit reached (${ent.aiConversationsPerMonth})`,
+      code: "AI_QUOTA_EXCEEDED",
+    }, { status: 403 });
   }
 
-  // 3. Build the answer from real data only.
+  // 3. Now safely produce the answer. Build the answer from REAL data only.
+  let facts: Record<string, unknown> = {};
+  let answerText: string;
+  let source: "llm" | "deterministic" | "no-data" | "mixed-currency" = "deterministic";
+
   const vehicles = await db.vehicle.findMany({ where: { userId: user.id, archived: false } });
   if (vehicles.length === 0) {
-    return ok({
-      answer: "You have not added any vehicles yet. Add one to start asking questions.",
-      source: "no-data",
-      facts: {},
-      conversationId: createdConversationId,
-    });
-  }
+    answerText = "You have not added any vehicles yet. Add one to start asking questions.";
+    source = "no-data";
+  } else {
+    const vehicle = vehicles.find((v) => v.isPrimary) ?? vehicles[0];
+    const result = await computeVehicleCost(user.id, vehicle.id);
+    if (!result.ok) {
+      answerText = "I can't compute totals right now because your expenses and fuel entries use multiple currencies. Use a single currency for this vehicle and try again.";
+      source = "mixed-currency";
+    } else {
+      const summary: CostSummary = result.summary;
+      const currency = summary.baseCurrency;
+      const forecast12 = projectCost(summary, 12);
+      facts = {
+        vehicle: `${vehicle.year} ${vehicle.brand} ${vehicle.model}`,
+        currency,
+        monthsOfData: summary.monthsOfData,
+        totalSpent: formatMoney(summary.totalSpent, currency),
+        monthlyAverage: formatMoney(summary.monthlyAverage, currency),
+        annualEstimate: formatMoney(summary.annualEstimate, currency),
+        costPerUnit: summary.costPerKm != null ? `${formatMoney(summary.costPerKm, currency)} per ${vehicle.currentMileageUnit ?? "km"}` : "not enough data",
+        totalFuel: formatMoney(summary.totalFuel, currency),
+        totalMaintenance: formatMoney(summary.totalMaintenance, currency),
+        totalInsurance: formatMoney(summary.totalInsurance, currency),
+        forecast12mo: formatMoney(forecast12.total, currency),
+        forecastAssumptions: forecast12.assumptions,
+        breakdownByCategory: summary.breakdown.map((b) => `${b.category}=${formatMoney(b.amount, currency)} (${b.percent}%)`).join(", "),
+      };
 
-  const vehicle = vehicles.find((v) => v.isPrimary) ?? vehicles[0];
-  const result = await computeVehicleCost(user.id, vehicle.id);
-  if (!result.ok) {
-    return ok({
-      answer: "I can't compute totals right now because your expenses and fuel entries use multiple currencies. Use a single currency for this vehicle and try again.",
-      source: "mixed-currency",
-      facts: {},
-      conversationId: createdConversationId,
-    });
-  }
-  const summary: CostSummary = result.summary;
-  const currency = summary.baseCurrency;
-  const forecast12 = projectCost(summary, 12);
-
-  const facts = {
-    vehicle: `${vehicle.year} ${vehicle.brand} ${vehicle.model}`,
-    currency,
-    monthsOfData: summary.monthsOfData,
-    totalSpent: formatMoney(summary.totalSpent, currency),
-    monthlyAverage: formatMoney(summary.monthlyAverage, currency),
-    annualEstimate: formatMoney(summary.annualEstimate, currency),
-    costPerUnit: summary.costPerKm != null ? `${formatMoney(summary.costPerKm, currency)} per ${vehicle.currentMileageUnit ?? "km"}` : "not enough data",
-    totalFuel: formatMoney(summary.totalFuel, currency),
-    totalMaintenance: formatMoney(summary.totalMaintenance, currency),
-    totalInsurance: formatMoney(summary.totalInsurance, currency),
-    forecast12mo: formatMoney(forecast12.total, currency),
-    forecastAssumptions: forecast12.assumptions,
-    breakdownByCategory: summary.breakdown.map((b) => `${b.category}=${formatMoney(b.amount, currency)} (${b.percent}%)`).join(", "),
-  };
-
-  // 4. LLM (only if key configured). Deterministic fallback ALWAYS works.
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (apiKey) {
-    try {
-      const answer = await callLlm(apiKey, question, facts);
-      return ok({ answer, source: "llm", facts, conversationId: createdConversationId });
-    } catch (e) {
-      console.error("AI LLM failed", e);
-      // Fall through to deterministic — quota already consumed.
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (apiKey) {
+        try {
+          answerText = await callLlm(apiKey, question, facts);
+          source = "llm";
+        } catch (e) {
+          // Deterministic fallback when LLM fails. Quota already consumed
+          // — that is the documented product decision (failed-call users
+          // can retry without burning an extra quota unit because the
+          // fallback still produced a useful answer).
+          console.error("AI LLM failed", e);
+          answerText = deterministicAnswer(question, facts, summary, currency);
+        }
+      } else {
+        answerText = deterministicAnswer(question, facts, summary, currency);
+      }
     }
   }
 
-  const answer = deterministicAnswer(question, facts, summary, currency);
-  return ok({ answer, source: "deterministic", facts, conversationId: createdConversationId });
+  // 4. Persist conversation + user message + assistant message. This is a
+  //    side effect but cannot affect the quota claim — if it fails, we
+  //    intentionally keep the reservation (the user consumed AI capacity).
+  try {
+    await persistConversation(user.id, question, answerText, source);
+  } catch (e) {
+    console.error("Failed to persist AI conversation", e);
+  }
+
+  return ok({ answer: answerText, source, facts });
 });
+
+async function persistConversation(
+  userId: string,
+  userMessage: string,
+  assistantMessage: string,
+  source: string
+): Promise<void> {
+  const conv = await db.conversation.create({ data: { userId } });
+  await db.conversationMessage.createMany({
+    data: [
+      { conversationId: conv.id, role: "user", content: userMessage },
+      { conversationId: conv.id, role: "assistant", content: assistantMessage, tokenCount: source === "llm" ? 1 : 0 },
+    ],
+  });
+}
 
 async function callLlm(apiKey: string, question: string, facts: Record<string, unknown>): Promise<string> {
   const sys = "You are the AutoEco financial assistant. Answer using ONLY the JSON facts provided. " +

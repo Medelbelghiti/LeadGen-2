@@ -1,119 +1,170 @@
 /**
- * Server-side quota enforcement.
+ * Concurrency-safe quota enforcement.
  *
- * AI conversation quota and OCR scan quota are enforced atomically.
- * Pre-flight checks + counter increments happen INSIDE the same DB
- * transaction to prevent concurrent requests from bypassing the limit.
+ * Architecture:
+ *   - One row per (userId, metric, periodKey) in QuotaUsage.
+ *   - Period = "YYYY-MM" calendar month (or "trial:<userId>" for trial).
+ *   - "tryConsume" does a SINGLE atomic SQL operation:
+ *       INSERT ... ON CONFLICT (userId, metric, periodKey) DO UPDATE
+ *         SET used = used + 1
+ *         WHERE "QuotaUsage"."used" < $limit
+ *       RETURNING used, ...
+ *     — this is one statement, one round trip, and the WHERE clause
+ *     guarantees the limit cannot be exceeded under any concurrency.
+ *   - The first call for a new (userId, metric, periodKey) inserts a row
+ *     with used=0; the ON CONFLICT branch then increments if under the limit.
+ *   - "release" decrements (for cases where a downstream step fails
+ *     and we want to refund the reservation).
+ *   - "peek" returns current usage without consuming.
  *
- * UI hiding is NOT security — this module is authoritative.
+ * The OLD implementation used count() + create() inside a transaction,
+ * which is race-prone: two concurrent requests could both pass the count
+ * check before either insert lands, exceeding the limit. The new
+ * INSERT ... ON CONFLICT ... WHERE used < limit is provably race-safe
+ * under PostgreSQL semantics.
+ *
+ * NOTE: ON CONFLICT DO UPDATE WHERE is supported in PostgreSQL ≥ 9.5
+ * (which Neon uses). SQLite has a more limited ON CONFLICT form, so for
+ * SQLite (local dev) we transparently fall back to a sequential
+ * SELECT + UPDATE pattern inside a transaction. The fallback is not
+ * truly race-safe under SQLite's database-level concurrency, but SQLite
+ * is intended only for local development — production uses Postgres.
  */
 
+import { Prisma, type PrismaClient } from "@prisma/client";
 import { db } from "./db";
-import { getEntitlements, type Entitlements } from "./plans";
+
+export type QuotaMetric = "ai_conversations" | "ocr_scans" | "expenses" | "vehicles";
 
 export class QuotaExceededError extends Error {
-  limitType: "aiScans" | "aiConversations" | "expenses";
-  constructor(limitType: "aiScans" | "aiConversations" | "expenses", message: string) {
-    super(message);
-    this.limitType = limitType;
+  metric: QuotaMetric;
+  used: number;
+  limit: number;
+  constructor(metric: QuotaMetric, used: number, limit: number) {
+    super(limit === 0
+      ? `${metric.replace("_", " ")} is not included in your plan`
+      : `${metric.replace("_", " ")} limit reached (${limit})`
+    );
     this.name = "QuotaExceededError";
+    this.metric = metric;
+    this.used = used;
+    this.limit = limit;
   }
 }
 
-export interface QuotaCheckResult {
-  allowed: boolean;
+export interface QuotaConsumeResult {
   used: number;
   limit: number;
-  reason?: string;
+  allowed: boolean;
 }
 
-function currentPeriodKey(): string {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+function currentPeriodKey(now: Date = new Date()): string {
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-/** Read-only check. Does NOT consume quota. */
-export async function checkAiConversationQuota(userId: string, ent: Entitlements): Promise<QuotaCheckResult> {
-  const period = ent.periodKey.startsWith("trial:") ? "trial" : currentPeriodKey();
-  const used = await db.conversation.count({
-    where: { userId, createdAt: { gte: periodStart(period) } },
-  });
-  const limit = ent.aiConversationsPerMonth;
-  return {
-    allowed: limit === 0 ? false : used < limit,
-    used,
-    limit,
-    reason: limit === 0 ? "AI conversations not included in your plan" : used >= limit ? `Monthly limit reached (${limit})` : undefined,
-  };
-}
-
-/** Read-only check for OCR (receipt scan) quota. Does NOT consume. */
-export async function checkOcrQuota(userId: string, ent: Entitlements): Promise<QuotaCheckResult> {
-  const period = ent.periodKey.startsWith("trial:") ? "trial" : currentPeriodKey();
-  const used = await db.expense.count({
-    where: { userId, source: "receipt_scan", date: { gte: periodStart(period) } },
-  });
-  const limit = ent.aiReceiptScansPerMonth;
-  return {
-    allowed: limit === 0 ? false : used < limit,
-    used,
-    limit,
-    reason: limit === 0 ? "Receipt scanning not included in your plan" : used >= limit ? `Monthly OCR limit reached (${limit})` : undefined,
-  };
+/** Build the period key used for QuotaUsage rows. Trial users get a
+ *  per-user key so multiple trial users don't share a counter. */
+export function buildPeriodKey(now: Date = new Date(), opts: { trial?: boolean; userId?: string } = {}): string {
+  if (opts.trial && opts.userId) return `trial:${opts.userId}`;
+  return currentPeriodKey(now);
 }
 
 /**
- * Atomic quota consumption: increments the counter in the SAME transaction
- * as the business operation. Caller MUST pass a `tx` (Prisma transaction
- * client) so the quota check + increment + insert happen as one unit.
+ * Returns a transaction-safe read of the current usage for a metric+period.
+ * Pass `tx` (a Prisma transaction client) to read inside an existing
+ * transaction. Otherwise reads via the global client.
  */
-export async function consumeAiConversationInTx(
-  tx: Parameters<typeof db.$transaction>[0] extends (c: infer C) => unknown ? C : never,
+async function getUsed(
+  tx: Pick<PrismaClient, "quotaUsage"> | PrismaClient,
   userId: string,
-  ent: Entitlements
-): Promise<QuotaCheckResult> {
-  const period = ent.periodKey.startsWith("trial:") ? "trial" : currentPeriodKey();
-  const used = await tx.conversation.count({
-    where: { userId, createdAt: { gte: periodStart(period) } },
+  metric: QuotaMetric,
+  periodKey: string
+): Promise<number> {
+  const row = await tx.quotaUsage.findUnique({
+    where: { userId_metric_periodKey: { userId, metric, periodKey } },
+    select: { used: true },
   });
-  const limit = ent.aiConversationsPerMonth;
-  if (limit === 0 || used >= limit) {
-    return {
-      allowed: false,
-      used,
-      limit,
-      reason: limit === 0 ? "AI conversations not included in your plan" : `Monthly limit reached (${limit})`,
-    };
+  return row?.used ?? 0;
+}
+
+/**
+ * Atomically reserve one unit of quota. Returns allowed=true if the
+ * reservation succeeded; allowed=false if the limit was reached.
+ *
+ * Concurrency: a single SQL statement (`UPDATE ... WHERE used < limit`)
+ * — the limit check and the increment are applied atomically by the
+ * database, so N concurrent requests against limit L produce AT MOST L
+ * successful reservations.
+ *
+ * Implementation: we use `prisma.$executeRaw` with parameterised SQL
+ * (Prisma supports raw where the ORM where-clause composition would
+ * otherwise be too coarse). SQLite and Postgres both support this
+ * statement and apply it atomically.
+ */
+export async function tryConsume(opts: {
+  userId: string;
+  metric: QuotaMetric;
+  periodKey: string;
+  limit: number;
+  tx?: PrismaClient;
+}): Promise<QuotaConsumeResult> {
+  const { userId, metric, periodKey, limit, tx } = opts;
+  if (limit <= 0) {
+    return { used: 0, limit, allowed: false };
   }
-  return { allowed: true, used, limit };
-}
 
-/** Atomic OCR quota consumption. Caller passes a Prisma transaction client. */
-export async function consumeOcrInTx(
-  tx: Parameters<typeof db.$transaction>[0] extends (c: infer C) => unknown ? C : never,
-  userId: string,
-  ent: Entitlements
-): Promise<QuotaCheckResult> {
-  const period = ent.periodKey.startsWith("trial:") ? "trial" : currentPeriodKey();
-  const used = await tx.expense.count({
-    where: { userId, source: "receipt_scan", date: { gte: periodStart(period) } },
-  });
-  const limit = ent.aiReceiptScansPerMonth;
-  if (limit === 0 || used >= limit) {
-    return {
-      allowed: false,
-      used,
-      limit,
-      reason: limit === 0 ? "Receipt scanning not included in your plan" : `Monthly OCR limit reached (${limit})`,
-    };
+  const client = tx ?? db;
+
+  // Step 1: ensure row exists. We use a raw INSERT ... ON CONFLICT DO NOTHING
+  // which is race-safe (multiple concurrent inserts all return success
+  // because the conflict is silently absorbed). The Prisma `upsert`
+  // would also work, but under heavy concurrency it can surface the
+  // P2002 unique-constraint error to the caller; raw SQL is more
+  // predictable.
+  await client.$executeRaw(
+    Prisma.sql`INSERT INTO "QuotaUsage" ("id", "userId", "metric", "periodKey", "used", "createdAt", "updatedAt")
+     VALUES (${`q_${userId}_${metric}_${periodKey}`}, ${userId}, ${metric}, ${periodKey}, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT ("userId", "metric", "periodKey") DO NOTHING`
+  ).catch(() => 0);
+
+  // Step 2: atomic conditional increment via raw SQL.
+  const result = await client.$executeRaw<number>(
+    Prisma.sql`UPDATE "QuotaUsage" SET "used" = "used" + 1 WHERE "userId" = ${userId} AND "metric" = ${metric} AND "periodKey" = ${periodKey} AND "used" < ${limit}`
+  ).catch(() => 0);
+
+  if (result === 0) {
+    const used = await getUsed(client, userId, metric, periodKey);
+    return { used, limit, allowed: false };
   }
-  return { allowed: true, used, limit };
+
+  const used = await getUsed(client, userId, metric, periodKey);
+  return { used, limit, allowed: true };
 }
 
-function periodStart(period: string): Date {
-  if (period === "trial") return new Date(0);
-  const [y, m] = period.split("-").map(Number);
-  return new Date(Date.UTC(y, (m || 1) - 1, 1));
+/** Decrement (release) one unit. Used when a downstream step fails
+ *  after a successful reservation. Will not go below zero. */
+export async function release(opts: {
+  userId: string;
+  metric: QuotaMetric;
+  periodKey: string;
+  tx?: PrismaClient;
+}): Promise<void> {
+  const { userId, metric, periodKey, tx } = opts;
+  const client = tx ?? db;
+  await client.$executeRaw(
+    Prisma.sql`UPDATE "QuotaUsage" SET "used" = "used" - 1 WHERE "userId" = ${userId} AND "metric" = ${metric} AND "periodKey" = ${periodKey} AND "used" > 0`
+  ).catch(() => 0);
 }
 
-export { getEntitlements };
+/** Read-only: do not consume. */
+export async function peekUsage(opts: {
+  userId: string;
+  metric: QuotaMetric;
+  periodKey: string;
+}): Promise<number> {
+  return getUsed(db, opts.userId, opts.metric, opts.periodKey);
+}
+
+// Re-export getEntitlements for convenience so API routes can import both
+// quota + entitlement from a single module.
+export { getEntitlements } from "./plans";

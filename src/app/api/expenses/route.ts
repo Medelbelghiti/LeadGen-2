@@ -1,11 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withErrorHandling, parseJson, ok } from "@/lib/http";
-import { requireUser } from "@/lib/auth";
+import { requireUser, assertOwnership } from "@/lib/auth";
 import { db } from "@/lib/db";
-import { getEntitlements, LimitReachedError } from "@/lib/plans";
-import { getMonthlyUsage } from "@/lib/usage";
-import { assertOwnership } from "@/lib/auth";
+import { getEntitlements } from "@/lib/plans";
+import { buildPeriodKey, tryConsume, release } from "@/lib/quota";
 import { SUPPORTED_CURRENCIES } from "@/lib/currency";
 
 const ExpenseSchema = z.object({
@@ -36,31 +35,55 @@ export const POST = withErrorHandling(async (req) => {
   const user = await requireUser();
   const body = await parseJson(req, ExpenseSchema);
 
+  // 1. Vehicle ownership.
   const vehicle = await db.vehicle.findUnique({ where: { id: body.vehicleId } });
   if (!vehicle) return NextResponse.json({ error: "Vehicle not found" }, { status: 404 });
   assertOwnership(vehicle.userId, user);
 
+  // 2. Authoritative entitlement + atomic quota reservation.
   const ent = await getEntitlements(user);
-  const usage = await getMonthlyUsage(user.id);
-  if (usage.expenses >= ent.maxExpensesPerMonth) {
-    throw new LimitReachedError("expenses", `Monthly expense limit reached (${ent.maxExpensesPerMonth}).`);
+  const periodKey = buildPeriodKey(new Date(), { trial: ent.isTrial, userId: user.id });
+  const reservation = await tryConsume({
+    userId: user.id,
+    metric: "expenses",
+    periodKey,
+    limit: ent.maxExpensesPerMonth,
+  });
+  if (!reservation.allowed) {
+    return NextResponse.json(
+      {
+        error: ent.maxExpensesPerMonth === 0
+          ? "Expense entry is not included in your plan"
+          : `Monthly expense limit reached (${ent.maxExpensesPerMonth})`,
+        code: "EXPENSE_QUOTA_EXCEEDED",
+      },
+      { status: 403 }
+    );
   }
 
-  const created = await db.expense.create({
-    data: {
-      userId: user.id,
-      vehicleId: body.vehicleId,
-      category: body.category,
-      amountCents: body.amountCents,
-      currency: body.currency,
-      date: new Date(body.date),
-      merchant: body.merchant ?? null,
-      mileage: body.mileage ?? null,
-      mileageUnit: body.mileageUnit ?? user.distanceUnit,
-      notes: body.notes ?? null,
-      recurring: body.recurring ?? false,
-      source: body.source ?? "manual",
-    },
-  });
+  // 3. Create the expense. If this fails, release the quota reservation.
+  let created;
+  try {
+    created = await db.expense.create({
+      data: {
+        userId: user.id,
+        vehicleId: body.vehicleId,
+        category: body.category,
+        amountCents: body.amountCents,
+        currency: body.currency,
+        date: new Date(body.date),
+        merchant: body.merchant ?? null,
+        mileage: body.mileage ?? null,
+        mileageUnit: body.mileageUnit ?? user.distanceUnit,
+        notes: body.notes ?? null,
+        recurring: body.recurring ?? false,
+        source: body.source ?? "manual",
+      },
+    });
+  } catch (e) {
+    await release({ userId: user.id, metric: "expenses", periodKey }).catch(() => {});
+    throw e;
+  }
+
   return ok(created);
 });
