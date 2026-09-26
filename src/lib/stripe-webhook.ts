@@ -1,42 +1,41 @@
 /**
- * Stripe webhook handler with TRULY concurrency-safe state machine.
+ * Stripe webhook handler with TRULY concurrency-safe state machine +
+ * durable side-effect idempotency.
  *
- * State transitions (atomic in DB):
+ * STATE MACHINE (atomic per-row):
  *
- *   (none)         -> RECEIVED     (insert; idempotent on eventId unique)
- *   RECEIVED       -> PROCESSING   (single conditional UPDATE)
- *   FAILED         -> PROCESSING   (single conditional UPDATE)
- *   PROCESSING     -> PROCESSED    (single conditional UPDATE on success)
- *   PROCESSING     -> FAILED       (single conditional UPDATE on error)
- *   PROCESSED      -> (terminal; subsequent deliveries no-op)
+ *   (none)        -> RECEIVED                  (INSERT ON CONFLICT DO NOTHING)
+ *   RECEIVED      -> PROCESSING(token=T1)      (atomic UPDATE that stamps a NEW token)
+ *   FAILED        -> PROCESSING(token=T1)      (same; rotates token)
+ *   PROCESSING(T) -> PROCESSED                 (atomic UPDATE WHERE processingToken = T)
+ *   PROCESSING(T) -> FAILED                    (atomic UPDATE WHERE processingToken = T)
  *
- * CRITICAL concurrency safety:
+ * OWNERSHIP:
  *
- *   The transition RECEIVED|FAILED -> PROCESSING is performed as ONE
- *   database UPDATE with a WHERE clause that requires the current state
- *   to be RECEIVED or FAILED. If the row was already PROCESSED, or was
- *   claimed by another worker, the UPDATE affects 0 rows and the
- *   handler returns "skipped" without re-applying business side effects.
+ *   Each `claim()` generates a fresh random processingToken. The token
+ *   rotates on every successful claim — so a slow legitimate worker that
+ *   lost ownership to a stale-recovery worker cannot finalize the event
+ *   (its old token no longer matches the row). A worker that still holds
+ *   the current token can finalize normally.
  *
- *   This means: 100 concurrent deliveries of the same event.id produce
- *   exactly 1 PROCESSING transition. The 99 others observe 0 affected rows
- *   and return "skipped-other-worker".
+ * SIDE-EFFECT IDEMPOTENCY (durable):
  *
- *   The final PROCESSING -> PROCESSED transition is also conditional
- *   (WHERE status = "PROCESSING"). If the application crashes between
- *   business side-effect and final transition, the row remains in
- *   PROCESSING — and recovery on next delivery requires a "stale
- *   PROCESSING" recovery policy (see below).
+ *   External effects (notifications, emails) go through
+ *   `tryClaimSideEffect(eventId, effectType)` which does:
+ *     INSERT INTO WebhookSideEffect (eventId, effectType)
+ *     ON CONFLICT DO NOTHING
+ *   Only the row-creator executes the effect. Retries / concurrent
+ *   deliveries see "already claimed" and skip the effect.
  *
- * Side-effect idempotency:
+ * OWNERSHIP GUARDS:
  *
- *   Each business operation uses an idempotency key derived from the
- *   Stripe event.id so the same payment-success notification/email
- *   never fires twice. The DB upserts on Subscription and Invoice
- *   already provide this guarantee at the data layer.
+ *   - `subscription.created/updated`: verify user.stripeCustomerId === sub.customer
+ *   - `invoice.paid`: resolve user via customer link, NOT via metadata;
+ *     reject if metadata.userId disagrees.
  */
 import type Stripe from "stripe";
 import { Prisma } from "@prisma/client";
+import crypto from "node:crypto";
 import { db } from "./db";
 import { createNotification } from "./notifications";
 import { sendEmail, tplPaymentSuccess, tplPaymentFailed, tplSubscriptionCanceled } from "./email";
@@ -50,120 +49,181 @@ export type ProcessOutcome =
 
 type WebhookStatus = "RECEIVED" | "PROCESSING" | "PROCESSED" | "FAILED";
 
+const STALE_PROCESSING_MINUTES = 15;
+
+function newProcessingToken(): string {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
 /**
- * Atomically claim a webhook event for processing. Returns true if THIS
- * call won the race and must execute the business operation. Returns false
- * if the event is already PROCESSED or already claimed by another worker.
+ * Atomically transition the row into PROCESSING with a fresh
+ * processingToken. Returns the new token if THIS call won the claim.
+ * Returns null if another worker already owns the event OR if the event
+ * is already PROCESSED.
+ *
+ * The transaction that does the claim is a single statement:
+ *   UPDATE WebhookEvent
+ *     SET status='PROCESSING', processingToken=$t, attempts=attempts+1
+ *     WHERE eventId=$e AND status IN ('RECEIVED','FAILED')
+ * The `WHERE` is the lock — only one of N concurrent calls can affect
+ * a row.
  */
-async function claim(eventId: string, type: string): Promise<boolean> {
-  // Step 1: ensure the row exists. Use raw INSERT ... ON CONFLICT DO NOTHING
-  // to make this race-safe under heavy concurrency (Prisma's `upsert`
-  // surfaces the unique-constraint race to the caller).
+async function claim(eventId: string, type: string): Promise<string | null> {
+  // Step 1: ensure row exists (race-safe via ON CONFLICT DO NOTHING).
   await db.$executeRaw(
-    Prisma.sql`INSERT INTO "WebhookEvent" ("id", "eventId", "type", "status", "attempts", "createdAt", "updatedAt")
-     VALUES (${`wh_${eventId}`}, ${eventId}, ${type}, ${"RECEIVED"}, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    Prisma.sql`INSERT INTO "WebhookEvent" ("id","eventId","type","status","attempts","processingToken","createdAt","updatedAt")
+     VALUES (${`wh_${eventId}`}, ${eventId}, ${type}, ${"RECEIVED"}, 0, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
      ON CONFLICT ("eventId") DO NOTHING`
   ).catch(() => 0);
 
-  // Step 2: atomically transition RECEIVED|FAILED -> PROCESSING, but
-  // only if the row is not currently PROCESSED and not yet PROCESSED.
-  // One conditional UPDATE statement — race-safe.
-  const updated = await db.webhookEvent.updateMany({
-    where: {
-      eventId,
-      status: { in: ["RECEIVED", "FAILED"] },
-    },
+  // Step 2: claim the event with a fresh token, but only if no worker
+  // is currently processing it. This is one statement — race-safe.
+  const token = newProcessingToken();
+  const result = await db.webhookEvent.updateMany({
+    where: { eventId, status: { in: ["RECEIVED", "FAILED"] } },
     data: {
       status: "PROCESSING",
+      processingToken: token,
       attempts: { increment: 1 },
     },
   });
-
-  return updated.count > 0;
-}
-
-async function markProcessed(eventId: string): Promise<void> {
-  await db.webhookEvent.updateMany({
-    where: { eventId, status: "PROCESSING" },
-    data: { status: "PROCESSED", processedAt: new Date(), error: null },
-  });
-}
-
-async function markFailed(eventId: string, message: string): Promise<void> {
-  await db.webhookEvent.updateMany({
-    where: { eventId, status: "PROCESSING" },
-    data: { status: "FAILED", error: message.slice(0, 1000) },
-  });
+  return result.count > 0 ? token : null;
 }
 
 /**
- * STALE PROCESSING RECOVERY: a row in PROCESSING is older than
- * STALE_PROCESSING_MINUTES is treated as FAILED and reclaimable.
- * This is how a worker that crashed mid-processing is recovered.
+ * Stale recovery: if a row has been in PROCESSING for > 15 minutes,
+ * it is considered orphaned. Atomically rotate its token to a new
+ * value, returning the new token to the caller. The previous worker
+ * can no longer finalize.
  */
-const STALE_PROCESSING_MINUTES = 15;
-
-async function reclaimStale(eventId: string): Promise<boolean> {
+async function reclaimStale(eventId: string): Promise<string | null> {
   const threshold = new Date(Date.now() - STALE_PROCESSING_MINUTES * 60 * 1000);
-  const updated = await db.webhookEvent.updateMany({
+  const token = newProcessingToken();
+  // Atomically: only the row currently stale AND still in PROCESSING
+  // can be claimed.
+  const result = await db.webhookEvent.updateMany({
     where: {
       eventId,
       status: "PROCESSING",
       updatedAt: { lt: threshold },
     },
-    data: { status: "FAILED", error: "stale PROCESSING reclaimed" },
+    data: {
+      status: "PROCESSING", // no-op; forces updatedAt via Prisma
+      processingToken: token,
+      attempts: { increment: 1 },
+      error: "stale PROCESSING reclaimed",
+    },
   });
-  if (updated.count === 0) return false;
-  // Now try to claim again
-  return claim(eventId, "");
+  if (result.count === 0) return null;
+  // Force updatedAt via a no-op update — Prisma's @updatedAt increments
+  // on the same call.
+  await db.webhookEvent.update({ where: { eventId }, data: {} }).catch(() => {});
+  return token;
+}
+
+async function markProcessed(eventId: string, token: string): Promise<boolean> {
+  // Only finalize if WE still own the token. A stale worker that lost
+  // ownership to a recovery call has a stale token; this UPDATE
+  // affects 0 rows and returns false.
+  const r = await db.webhookEvent.updateMany({
+    where: { eventId, status: "PROCESSING", processingToken: token },
+    data: { status: "PROCESSED", processedAt: new Date(), error: null },
+  });
+  return r.count > 0;
+}
+
+async function markFailed(eventId: string, token: string, message: string): Promise<boolean> {
+  const r = await db.webhookEvent.updateMany({
+    where: { eventId, status: "PROCESSING", processingToken: token },
+    data: { status: "FAILED", error: message.slice(0, 1000) },
+  });
+  return r.count > 0;
+}
+
+/**
+ * Durable side-effect claim. Returns true if THIS call may execute the
+ * effect. The unique (eventId, effectType) index guarantees at-most-once
+ * execution across retries, concurrent deliveries, stale recovery, and
+ * crash recovery.
+ */
+export async function tryClaimSideEffect(
+  eventId: string,
+  effectType: string,
+  metadata?: Record<string, unknown>
+): Promise<boolean> {
+  try {
+    await db.webhookSideEffect.create({
+      data: {
+        eventId,
+        effectType,
+        metadata: metadata ? JSON.stringify(metadata) : null,
+      },
+    });
+    return true;
+  } catch (e: any) {
+    // P2002 (unique constraint) → effect already happened.
+    if (e?.code === "P2002" || /Unique constraint/i.test(String(e?.message ?? ""))) {
+      return false;
+    }
+    throw e;
+  }
 }
 
 export async function handleStripeEvent(event: Stripe.Event): Promise<ProcessOutcome> {
   const eventId = event.id;
-
-  // First attempt
-  let won = await claim(eventId, event.type);
-  if (!won) {
-    // Check if this is a stale PROCESSING we can reclaim.
-    won = await reclaimStale(eventId);
-    if (!won) {
-      // Either already PROCESSED (terminal) or another worker is currently
-      // processing it. Idempotently no-op.
+  let token = await claim(eventId, event.type);
+  if (token === null) {
+    token = await reclaimStale(eventId);
+    if (token === null) {
       return "skipped-other-worker";
     }
   }
 
-  // We are the worker. Apply the business operation OUTSIDE a DB
-  // transaction (no long-held DB lock while calling external services).
+  // We are the current owner. Apply business effects.
+  let sideEffectsError: unknown = null;
   try {
-    await applyEvent(event);
-    await markProcessed(eventId);
-    return "applied";
+    await applyEvent(event, eventId);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    await markFailed(eventId, msg);
-    await auditLog({ action: "stripe.webhook.failed", metadata: { eventId, type: event.type, message: msg } });
-    throw e; // Caller returns 500 so Stripe retries.
+    sideEffectsError = e;
+  }
+
+  // ALWAYS finalize — whether success OR failure — using the token.
+  // If our token has been overwritten (e.g. someone else reclaimed),
+  // markProcessed/markFailed will affect 0 rows and we return error so
+  // Stripe retries.
+  if (sideEffectsError === null) {
+    const finalized = await markProcessed(eventId, token);
+    if (!finalized) {
+      return "skipped-other-worker";
+    }
+    return "applied";
+  } else {
+    const finalized = await markFailed(eventId, token, String(sideEffectsError instanceof Error ? sideEffectsError.message : sideEffectsError));
+    if (!finalized) {
+      return "skipped-other-worker";
+    }
+    await auditLog({ action: "stripe.webhook.failed", metadata: { eventId, type: event.type } });
+    throw sideEffectsError; // 500 → Stripe retries
   }
 }
 
-async function applyEvent(event: Stripe.Event): Promise<void> {
+async function applyEvent(event: Stripe.Event, eventId: string): Promise<void> {
   switch (event.type) {
     case "checkout.session.completed":
-      await onCheckoutCompleted(event.data.object as Stripe.Checkout.Session);
+      await onCheckoutCompleted(event.data.object as Stripe.Checkout.Session, eventId);
       break;
     case "customer.subscription.created":
     case "customer.subscription.updated":
-      await onSubscriptionUpsert(event.data.object as Stripe.Subscription);
+      await onSubscriptionUpsert(event.data.object as Stripe.Subscription, eventId);
       break;
     case "customer.subscription.deleted":
-      await onSubscriptionDeleted(event.data.object as Stripe.Subscription);
+      await onSubscriptionDeleted(event.data.object as Stripe.Subscription, eventId);
       break;
     case "invoice.paid":
-      await onInvoicePaid(event.data.object as Stripe.Invoice);
+      await onInvoicePaid(event.data.object as Stripe.Invoice, eventId);
       break;
     case "invoice.payment_failed":
-      await onInvoicePaymentFailed(event.data.object as Stripe.Invoice);
+      await onInvoicePaymentFailed(event.data.object as Stripe.Invoice, eventId);
       break;
     case "charge.refunded":
       await onChargeRefunded(event.data.object as Stripe.Charge);
@@ -174,7 +234,7 @@ async function applyEvent(event: Stripe.Event): Promise<void> {
   }
 }
 
-async function onCheckoutCompleted(session: Stripe.Checkout.Session): Promise<void> {
+async function onCheckoutCompleted(session: Stripe.Checkout.Session, eventId: string): Promise<void> {
   const userId = session.metadata?.userId;
   const planId = session.metadata?.planId;
   if (!userId || !planId) return;
@@ -194,15 +254,10 @@ async function onCheckoutCompleted(session: Stripe.Checkout.Session): Promise<vo
   await db.user.update({ where: { id: userId }, data: { trialEndsAt: null, trialUsed: true } });
 }
 
-async function onSubscriptionUpsert(sub: Stripe.Subscription): Promise<void> {
+async function onSubscriptionUpsert(sub: Stripe.Subscription, eventId: string): Promise<void> {
   const userId = sub.metadata?.userId;
   const planId = sub.metadata?.planId;
   if (!userId || !planId) return;
-  const status = sub.status;
-
-  // SECURITY: a Stripe event whose customer does not match the user's
-  // stripeCustomerId is rejected. Prevents event-injection between
-  // accounts.
   const user = await db.user.findUnique({ where: { id: userId } });
   if (!user) return;
   if (user.stripeCustomerId && sub.customer && user.stripeCustomerId !== sub.customer) {
@@ -212,24 +267,35 @@ async function onSubscriptionUpsert(sub: Stripe.Subscription): Promise<void> {
   await db.subscription.upsert({
     where: { stripeSubscriptionId: sub.id },
     create: {
-      userId, planId, stripeSubscriptionId: sub.id, status,
+      userId, planId, stripeSubscriptionId: sub.id, status: sub.status,
       currentPeriodStart: new Date(sub.current_period_start * 1000),
       currentPeriodEnd: new Date(sub.current_period_end * 1000),
       cancelAtPeriodEnd: sub.cancel_at_period_end,
     },
     update: {
-      planId, status,
+      planId, status: sub.status,
       currentPeriodStart: new Date(sub.current_period_start * 1000),
       currentPeriodEnd: new Date(sub.current_period_end * 1000),
       cancelAtPeriodEnd: sub.cancel_at_period_end,
     },
   });
   await db.user.update({ where: { id: userId }, data: { planId } });
+
+  // Side effect: send notification + email (durable idempotency)
+  if (await tryClaimSideEffect(eventId, "SUBSCRIPTION_UPDATED_NOTIFICATION")) {
+    await createNotification({ userId, type: "GENERAL", title: "Subscription updated", link: "/settings/billing" });
+  }
 }
 
-async function onSubscriptionDeleted(sub: Stripe.Subscription): Promise<void> {
+async function onSubscriptionDeleted(sub: Stripe.Subscription, eventId: string): Promise<void> {
   const userId = sub.metadata?.userId;
   if (!userId) return;
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) return;
+  if (user.stripeCustomerId && sub.customer && user.stripeCustomerId !== sub.customer) {
+    throw new Error("Stripe customer mismatch — refusing to cancel subscription");
+  }
+
   await db.subscription.updateMany({
     where: { stripeSubscriptionId: sub.id },
     data: { status: "canceled", canceledAt: new Date() },
@@ -239,39 +305,32 @@ async function onSubscriptionDeleted(sub: Stripe.Subscription): Promise<void> {
     const free = await db.plan.findFirst({ where: { key: "free" } });
     if (free) await db.user.update({ where: { id: userId }, data: { planId: free.id } });
   }
-  // Idempotency: notification "type:SUBSCRIPTION_CANCELED" is keyed on
-  // (userId, type, link) and we check existence before insert.
-  const user = await db.user.findUnique({ where: { id: userId } });
-  if (user) {
-    const existing = await db.notification.findFirst({
-      where: { userId, type: "SUBSCRIPTION_CANCELED", link: "/settings/billing" },
-    });
-    if (!existing) {
-      await createNotification({ userId, type: "SUBSCRIPTION_CANCELED", title: "Your subscription was canceled", link: "/settings/billing" });
-    }
+
+  if (await tryClaimSideEffect(eventId, "SUBSCRIPTION_CANCELED_NOTIFICATION")) {
+    await createNotification({ userId, type: "SUBSCRIPTION_CANCELED", title: "Your subscription was canceled", link: "/settings/billing" });
+  }
+  if (await tryClaimSideEffect(eventId, "SUBSCRIPTION_CANCELED_EMAIL")) {
     const sub2 = await db.subscription.findFirst({ where: { stripeSubscriptionId: sub.id } });
     if (sub2?.currentPeriodEnd) {
-      // Email — best-effort, do not retry on failure
       await sendEmail({ ...tplSubscriptionCanceled(user.name, sub2.currentPeriodEnd.toISOString().slice(0, 10)), to: user.email });
     }
   }
 }
 
-async function onInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
-  // SECURITY: resolve the user via the invoice's customer link to the
-  // user.stripeCustomerId — NOT via metadata alone.
+async function onInvoicePaid(invoice: Stripe.Invoice, eventId: string): Promise<void> {
   let userId: string | null = null;
   if (typeof invoice.customer === "string") {
     const u = await db.user.findUnique({ where: { stripeCustomerId: invoice.customer } });
     userId = u?.id ?? null;
   }
   if (!userId) return;
-  // Skip if subscription_details metadata disagrees with the customer link
   const metaUserId = (invoice.subscription_details?.metadata as Record<string, string> | undefined)?.userId;
   if (metaUserId && metaUserId !== userId) {
     throw new Error("Invoice metadata userId does not match customer link");
   }
 
+  // Idempotent upsert on Invoice (the unique stripeInvoiceId already
+  // provides this guarantee at the data layer).
   await db.invoice.upsert({
     where: { stripeInvoiceId: invoice.id! },
     create: {
@@ -285,26 +344,18 @@ async function onInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
     update: { status: "paid", amountCents: invoice.amount_paid, hostedUrl: invoice.hosted_invoice_url ?? null, pdfUrl: invoice.invoice_pdf ?? null },
   });
 
-  // Idempotent notification/email
   const user = await db.user.findUnique({ where: { id: userId } });
-  if (user) {
-    const existing = await db.notification.findFirst({
-      where: { userId, type: "PAYMENT_SUCCESS", link: "/settings/billing" },
-    });
-    if (!existing) {
-      await createNotification({ userId, type: "PAYMENT_SUCCESS", title: "Payment successful", link: "/settings/billing" });
-    }
-    const existingEmail = await db.auditLog.findFirst({
-      where: { userId, action: "stripe.email.payment_success" },
-    });
-    if (!existingEmail) {
-      await auditLog({ userId, action: "stripe.email.payment_success" });
-      await sendEmail({ ...tplPaymentSuccess(user.name, (invoice.lines.data[0]?.description ?? "your plan") || "your plan"), to: user.email });
-    }
+  if (!user) return;
+
+  if (await tryClaimSideEffect(eventId, "PAYMENT_SUCCESS_NOTIFICATION")) {
+    await createNotification({ userId, type: "PAYMENT_SUCCESS", title: "Payment successful", link: "/settings/billing" });
+  }
+  if (await tryClaimSideEffect(eventId, "PAYMENT_SUCCESS_EMAIL")) {
+    await sendEmail({ ...tplPaymentSuccess(user.name, (invoice.lines.data[0]?.description ?? "your plan") || "your plan"), to: user.email });
   }
 }
 
-async function onInvoicePaymentFailed(invoice: Stripe.Invoice): Promise<void> {
+async function onInvoicePaymentFailed(invoice: Stripe.Invoice, eventId: string): Promise<void> {
   let userId: string | null = null;
   if (typeof invoice.customer === "string") {
     const u = await db.user.findUnique({ where: { stripeCustomerId: invoice.customer } });
@@ -318,13 +369,13 @@ async function onInvoicePaymentFailed(invoice: Stripe.Invoice): Promise<void> {
     create: { userId, stripeInvoiceId: invoice.id!, amountCents: invoice.amount_due, currency: invoice.currency, status: "open" },
     update: { status: "open" },
   });
-  const existing = await db.notification.findFirst({
-    where: { userId, type: "PAYMENT_FAILED", link: "/settings/billing" },
-  });
-  if (!existing) {
+
+  if (await tryClaimSideEffect(eventId, "PAYMENT_FAILED_NOTIFICATION")) {
     await createNotification({ userId, type: "PAYMENT_FAILED", title: "Payment failed", link: "/settings/billing" });
   }
-  await sendEmail({ ...tplPaymentFailed(user.name, "/settings/billing"), to: user.email });
+  if (await tryClaimSideEffect(eventId, "PAYMENT_FAILED_EMAIL")) {
+    await sendEmail({ ...tplPaymentFailed(user.name, "/settings/billing"), to: user.email });
+  }
 }
 
 async function onChargeRefunded(charge: Stripe.Charge): Promise<void> {

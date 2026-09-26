@@ -163,6 +163,11 @@ model WebhookEvent {
   // Default for existing rows: PROCESSED if processedAt is set, else RECEIVED.
   status      String    @default("RECEIVED")
   attempts    Int       @default(0)
+  // Random opaque token that identifies the CURRENT owner of this event.
+  // Every claim() generates a new token. markProcessed/markFailed REQUIRE
+  // the matching token — a stale worker that lost ownership can no
+  // longer finalize the event. The token rotates on each new claim.
+  processingToken String?
   processedAt DateTime?
   error       String?
   createdAt   DateTime  @default(now())
@@ -604,4 +609,21 @@ model QuotaUsage {
 
   @@unique([userId, metric, periodKey])
   @@index([periodKey])
+}
+
+// ----------------------------- Webhook side effects -----------------------------
+// Durable idempotency for external side effects (emails, notifications).
+// Insert with (eventId, effectType) — UNIQUE constraint guarantees
+// at-most-once execution even under concurrent delivery, retry, or
+// stale recovery. The first successful insert owns the side effect;
+// subsequent callers observe P2002 and skip.
+model WebhookSideEffect {
+  id        String   @id @default(cuid())
+  eventId   String
+  effectType String
+  metadata  String?  // free-form JSON for debugging
+  createdAt DateTime @default(now())
+
+  @@unique([eventId, effectType])
+  @@index([eventId])
 }

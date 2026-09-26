@@ -43,12 +43,8 @@ export const POST = withErrorHandling(async (req) => {
   const periodKey = buildPeriodKey(new Date(), { trial: ent.isTrial, userId: user.id });
   const ocrAvailable = getOcrProvider().available;
 
-  // 4. Atomic quota reservation. Only run if OCR is actually available
-  //    (otherwise we don't want to "consume" OCR quota for manual uploads).
-  let reservation:
-    | { kind: "reserved" }
-    | { kind: "skipped" }
-    | { kind: "denied" } = { kind: "skipped" };
+  // 4. Atomic quota reservation. Only run if OCR is actually available.
+  let reserved = false;
   if (ocrAvailable) {
     const r = await tryConsume({
       userId: user.id,
@@ -67,35 +63,47 @@ export const POST = withErrorHandling(async (req) => {
         { status: 403 }
       );
     }
-    reservation = { kind: "reserved" };
+    reserved = true;
   }
 
-  // 5. Safe file write.
-  const bytes = Buffer.from(await file.arrayBuffer());
-  const ext = (file.name.split(".").pop() ?? "bin").toLowerCase();
-  const prefix = vehicleId ? `receipts/${vehicleId}` : `receipts/user/${user.id}`;
-  let stored: { storageKey: string; sizeBytes: number };
+  // 5–7. File write + OCR + DB persist with full rollback on any failure.
+  //
+  // Guarantees:
+  //   - file is deleted on OCR or DB failure
+  //   - quota is released exactly once on any failure
+  //   - on success, both stay consumed and persisted
+  //
+  // A "release" / "delete" never runs after the final OK response.
+  let stored: { storageKey: string; sizeBytes: number } | null = null;
   try {
+    // 5. Save file
+    const bytes = Buffer.from(await file.arrayBuffer());
+    const ext = (file.name.split(".").pop() ?? "bin").toLowerCase();
+    const prefix = vehicleId ? `receipts/${vehicleId}` : `receipts/user/${user.id}`;
     stored = await saveFile(prefix, ext, bytes);
+
+    // 6. Run OCR
+    const ocr = await getOcrProvider().extract({ bytes, mimeType: file.type });
+
+    // 7. Persist document
+    const title = typeof titleRaw === "string" && titleRaw.length > 0 ? titleRaw : (file.name || "Receipt");
+    const doc = await db.document.create({
+      data: {
+        userId: user.id, vehicleId, title, category,
+        storageKey: stored.storageKey, mimeType: file.type, sizeBytes: stored.sizeBytes,
+      },
+    });
+
+    // SUCCESS — return without touching quota or file
+    return ok({ document: doc, ocr, ocrAvailable, message: ocr.status === "unavailable" ? ocr.message : undefined });
   } catch (e) {
-    // File write failed — release quota if we reserved it.
-    if (reservation.kind === "reserved") {
-      await release({ userId: user.id, metric: "ocr_scans", periodKey }).catch(() => {});
+    // FAILURE — release both quota and file exactly once.
+    if (stored) {
+      try { await deleteFile(stored.storageKey); } catch { /* idempotent */ }
+    }
+    if (reserved) {
+      try { await release({ userId: user.id, metric: "ocr_scans", periodKey }); } catch { /* idempotent */ }
     }
     throw e;
   }
-
-  // 6. OCR call.
-  const ocr = await getOcrProvider().extract({ bytes, mimeType: file.type });
-
-  // 7. Persist document.
-  const title = typeof titleRaw === "string" && titleRaw.length > 0 ? titleRaw : (file.name || "Receipt");
-  const doc = await db.document.create({
-    data: {
-      userId: user.id, vehicleId, title, category,
-      storageKey: stored.storageKey, mimeType: file.type, sizeBytes: stored.sizeBytes,
-    },
-  });
-
-  return ok({ document: doc, ocr, ocrAvailable, message: ocr.status === "unavailable" ? ocr.message : undefined });
 });
